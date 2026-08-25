@@ -21,6 +21,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -254,6 +255,7 @@ struct AudioBlob {
     const uint8_t* data;
     size_t         size;
     std::shared_ptr<Ship::IResource> resource; // prevent release
+    std::vector<uint8_t> owned; // MEMFS-backed web copy
 };
 
 // File-scope so portAudioShutdownAssets() can reach them.  These must be
@@ -266,6 +268,34 @@ static AudioBlob music_sbk;
 static AudioBlob fgm_unk_blob, fgm_tbl_blob, fgm_ucd_blob;
 
 static bool loadBlob(const char* name, AudioBlob& out) {
+#if defined(__EMSCRIPTEN__)
+    const std::string path = std::string("/web_audio/") + name;
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        std::fprintf(stderr, "audio_bridge: failed to open web audio file '%s'\n", path.c_str());
+        return false;
+    }
+    std::fseek(file, 0, SEEK_END);
+    const long length = std::ftell(file);
+    std::rewind(file);
+    if (length <= 0) {
+        std::fclose(file);
+        std::fprintf(stderr, "audio_bridge: empty web audio file '%s'\n", path.c_str());
+        return false;
+    }
+    out.owned.resize(static_cast<size_t>(length));
+    const size_t read = std::fread(out.owned.data(), 1, out.owned.size(), file);
+    std::fclose(file);
+    if (read != out.owned.size()) {
+        out.owned.clear();
+        std::fprintf(stderr, "audio_bridge: short read for web audio file '%s'\n", path.c_str());
+        return false;
+    }
+    out.data = out.owned.data();
+    out.size = out.owned.size();
+    std::fprintf(stderr, "audio_bridge: loaded web file '%s' (%zu bytes)\n", name, out.size);
+    return true;
+#else
     auto ctx = Ship::Context::GetInstance();
     if (!ctx) { spdlog::error("audio_bridge: no Ship::Context"); return false; }
 
@@ -287,6 +317,7 @@ static bool loadBlob(const char* name, AudioBlob& out) {
     out.resource = res;
     spdlog::info("audio_bridge: loaded '{}' ({} bytes)", name, out.size);
     return true;
+#endif
 }
 
 /* ========================================================================= */
@@ -553,7 +584,10 @@ static SYAudioPackage* parsePackage(const u8* data, size_t size, ALHeap* heap) {
 
 extern "C" void portAudioLoadAssets(void)
 {
-    spdlog::info("audio_bridge: loading audio assets from .o2r");
+    // This runs inside BattleShip's cooperative web audio fiber.  spdlog's
+    // threaded sink can wait for a worker here and deadlock the browser main
+    // thread, so keep this path on synchronous stderr.
+    std::fprintf(stderr, "audio_bridge: loading preloaded audio assets\n");
 
     // Initialize heap
     memset(sSYAudioCurrentSettings.heap_base, 0, sSYAudioCurrentSettings.heap_size);
@@ -572,7 +606,7 @@ extern "C" void portAudioLoadAssets(void)
     ok = ok && loadBlob("audio/S1_music_sbk",   music_sbk);
 
     if (!ok) {
-        spdlog::error("audio_bridge: failed to load core audio assets, audio disabled");
+        std::fprintf(stderr, "audio_bridge: failed to load core audio assets, audio disabled\n");
         return;
     }
 
@@ -594,20 +628,20 @@ extern "C" void portAudioLoadAssets(void)
         BankParser parser(sounds1_ctl.data, sounds1_ctl.size, tbl1, &sSYAudioHeap);
         ALBankFile* bf = parser.parseBankFile();
         sSYAudioSequenceBank2 = bf->bankArray[0];
-        spdlog::info("audio_bridge: parsed sounds1_ctl → sSYAudioSequenceBank2 (music): {} instruments, rate={}",
+        std::fprintf(stderr, "audio_bridge: parsed music bank: %d instruments, rate=%d\n",
                      sSYAudioSequenceBank2->instCount, sSYAudioSequenceBank2->sampleRate);
     }
     {
         BankParser parser(sounds2_ctl.data, sounds2_ctl.size, tbl2, &sSYAudioHeap);
         ALBankFile* bf = parser.parseBankFile();
         sSYAudioSequenceBank1 = bf->bankArray[0];
-        spdlog::info("audio_bridge: parsed sounds2_ctl → sSYAudioSequenceBank1 (SFX): {} instruments, rate={}",
+        std::fprintf(stderr, "audio_bridge: parsed SFX bank: %d instruments, rate=%d\n",
                      sSYAudioSequenceBank1->instCount, sSYAudioSequenceBank1->sampleRate);
     }
 
     // Parse sequence file
     sSYAudioSeqFile = parseSeqFile(music_sbk.data, music_sbk.size, &sSYAudioHeap);
-    spdlog::info("audio_bridge: parsed seq file: {} sequences", sSYAudioSeqFile->seqCount);
+    std::fprintf(stderr, "audio_bridge: parsed sequence file: %d sequences\n", sSYAudioSeqFile->seqCount);
 
     // Find max sequence length and allocate sequence data buffers
     s32 maxSeqLen = 0;
@@ -667,8 +701,8 @@ extern "C" void portAudioLoadAssets(void)
         s32 totalStructBytes = count * 16;
         size_t neededBytes = 4 + (size_t)totalStructBytes;
         if (count <= 0 || neededBytes > blob_size) {
-            spdlog::error("audio_bridge: fgm_unk parse rejected — count={} blob_size={} needed={}",
-                          (int)count, (size_t)blob_size, (size_t)neededBytes);
+            std::fprintf(stderr, "audio_bridge: fgm_unk rejected: count=%d size=%zu needed=%zu\n",
+                         (int)count, (size_t)blob_size, (size_t)neededBytes);
         } else {
             u8 *flat = (u8*)alHeapAlloc(&sSYAudioHeap, 1, totalStructBytes);
             for (s32 i = 0; i < count; i++) {
@@ -686,7 +720,7 @@ extern "C" void portAudioLoadAssets(void)
             }
             dSYAudioPublicSettings.unk4C = sSYAudioCurrentSettings.unk4C = (u16)count;
             dSYAudioPublicSettings.unk44 = sSYAudioCurrentSettings.unk44 = (uintptr_t*)flat;
-            spdlog::info("audio_bridge: fgm_unk parsed as flat envelope array ({} entries, {} bytes)",
+            std::fprintf(stderr, "audio_bridge: parsed envelope array: %d entries, %d bytes\n",
                          (int)count, (int)totalStructBytes);
         }
     }
@@ -703,7 +737,7 @@ extern "C" void portAudioLoadAssets(void)
         dSYAudioPublicSettings3.fgm_ucode_data = sSYAudioCurrentSettings.fgm_ucode_data = pkg->data;
     }
 
-    spdlog::info("audio_bridge: all audio assets loaded successfully");
+    std::fprintf(stderr, "audio_bridge: all audio assets loaded successfully\n");
 }
 
 extern "C" void portAudioShutdownAssets(void)

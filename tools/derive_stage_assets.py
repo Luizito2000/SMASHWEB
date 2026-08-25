@@ -680,6 +680,30 @@ def extract_stage(stage: dict, rom: bytes, output_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def normalize_rom_byte_order(rom: bytes) -> bytes:
+    """Return ROM data in big-endian (.z64) byte order."""
+    header = rom[:4]
+    if header == bytes.fromhex("80371240"):
+        return rom
+    if header == bytes.fromhex("37804012"):
+        if len(rom) % 2:
+            raise ValueError("byte-swapped ROM has an odd file size")
+        normalized = bytearray(len(rom))
+        normalized[0::2] = rom[1::2]
+        normalized[1::2] = rom[0::2]
+        return bytes(normalized)
+    if header == bytes.fromhex("40123780"):
+        if len(rom) % 4:
+            raise ValueError("little-endian ROM size is not divisible by four")
+        normalized = bytearray(len(rom))
+        normalized[0::4] = rom[3::4]
+        normalized[1::4] = rom[2::4]
+        normalized[2::4] = rom[1::4]
+        normalized[3::4] = rom[0::4]
+        return bytes(normalized)
+    raise ValueError(f"unrecognized Nintendo 64 ROM header: {header.hex()}")
+
+
 def main(argv: list) -> int:
     if len(argv) != 2:
         print(
@@ -695,13 +719,11 @@ def main(argv: list) -> int:
         print(f"ERROR: ROM not found: {rom_path}", file=sys.stderr)
         return 1
 
-    rom = rom_path.read_bytes()
-    if rom[:4] != bytes([0x80, 0x37, 0x12, 0x40]):
-        print(
-            f"WARNING: ROM header is not .z64 ({rom[:4].hex()}). "
-            "Continuing anyway.",
-            file=sys.stderr,
-        )
+    try:
+        rom = normalize_rom_byte_order(rom_path.read_bytes())
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     errors = 0
     for stage in STAGES:

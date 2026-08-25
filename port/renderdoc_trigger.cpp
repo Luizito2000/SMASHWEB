@@ -16,6 +16,13 @@
  */
 
 #include "renderdoc_trigger.h"
+#if defined(__EMSCRIPTEN__)
+
+extern "C" void portRenderDocInit(void) {}
+extern "C" void portRenderDocOnFrame(unsigned int) {}
+extern "C" void portRenderDocShutdown(void) {}
+
+#else
 #include "renderdoc_app.h"
 #include "port_log.h"
 
@@ -217,3 +224,5 @@ extern "C" void portRenderDocShutdown(void)
     // init/shutdown symmetry without ifdefs.
     sRdocApi = nullptr;
 }
+
+#endif

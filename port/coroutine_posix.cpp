@@ -5,7 +5,7 @@
  * swapcontext() provides the resume/yield mechanism.
  */
 
-#if !defined(_WIN32) && !defined(__ANDROID__)
+#if !defined(_WIN32) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
 
 /*
  * macOS marks the ucontext / swapcontext routines as deprecated and hides
@@ -221,4 +221,4 @@ int port_coroutine_in_coroutine(void)
 	return sCurrentCoroutine != NULL;
 }
 
-#endif /* !_WIN32 && !__ANDROID__ */
+#endif /* !_WIN32 && !__ANDROID__ && !__EMSCRIPTEN__ */

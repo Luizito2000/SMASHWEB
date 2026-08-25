@@ -3,6 +3,17 @@
  */
 
 #include "port_watchdog.h"
+#if defined(__EMSCRIPTEN__)
+
+extern "C" void port_watchdog_init(void) {}
+extern "C" void port_watchdog_shutdown(void) {}
+extern "C" void port_watchdog_note_yield(void) {}
+extern "C" void port_watchdog_note_resume_start(int) {}
+extern "C" void port_watchdog_note_resume_end(int) {}
+extern "C" void port_watchdog_note_frame_end(void) {}
+extern "C" void port_dump_backtrace(void) {}
+
+#else
 #include "port_log.h"
 
 #include <atomic>
@@ -582,4 +593,6 @@ extern "C" void port_dump_backtrace(void) {
 }
 #else
 extern "C" void port_dump_backtrace(void) { /* stub on Windows */ }
+#endif
+
 #endif

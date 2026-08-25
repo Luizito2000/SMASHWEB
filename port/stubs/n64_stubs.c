@@ -115,6 +115,7 @@ void port_resume_service_threads(void)
 		         (int)sGameThreadCapResumes);
 	}
 	int game_thread_resumes_this_frame = 0;
+	int audio_thread_resumes_this_frame = 0;
 
 	for (s32 round = 0; round < 8; round++) {
 		s32 progress = 0;
@@ -139,6 +140,16 @@ void port_resume_service_threads(void)
 				continue;
 			}
 
+#if defined(__EMSCRIPTEN__)
+			/* One 32 kHz synthesis block is produced per video frame.  Letting
+			 * the cooperative audio thread run again in each of the eight
+			 * service rounds makes it synthesize a backlog in one browser task,
+			 * starving rendering and triggering Chrome's unresponsive warning. */
+			if ((int)t->id == 4 && audio_thread_resumes_this_frame >= 1) {
+				continue;
+			}
+#endif
+
 			/* Resume this thread — it will run until it yields again. */
 			t->state = OS_STATE_RUNNING;
 			port_watchdog_note_resume_start((int)t->id);
@@ -151,6 +162,9 @@ void port_resume_service_threads(void)
 			}
 			if ((int)t->id == 5) {
 				game_thread_resumes_this_frame++;
+			}
+			if ((int)t->id == 4) {
+				audio_thread_resumes_this_frame++;
 			}
 			if (sResumeDebugCount <= 5) {
 				port_log("  round %d: resumed thread %d (finished=%d)\n",
@@ -203,6 +217,18 @@ void osStartThread(OSThread *t)
 	/* Resume the coroutine.  It will run until it yields (at an
 	 * osRecvMesg BLOCK or osStopThread) then return here. */
 	if (t->port_coroutine != NULL) {
+#if defined(__EMSCRIPTEN__)
+		/* Emscripten fibers use Asyncify. Starting the controller fiber from
+		 * inside Thread 5 adds one more nested unwind layer than the browser
+		 * backend can safely sustain and freezes before its entry point. Queue
+		 * it for port_resume_service_threads on the next animation frame; Thread
+		 * 5 immediately reaches its ready-message wait and unwinds normally. */
+		if (t->id == 6 && port_coroutine_in_coroutine()) {
+			t->state = OS_STATE_WAITING;
+			port_log("SSB64: web deferred initial start of controller thread\n");
+			return;
+		}
+#endif
 		t->state = OS_STATE_RUNNING;
 		port_coroutine_resume((PortCoroutine *)t->port_coroutine);
 		if (port_coroutine_is_finished((PortCoroutine *)t->port_coroutine)) {
@@ -269,6 +295,13 @@ void osCreateMesgQueue(OSMesgQueue *mq, OSMesg *msg, s32 count)
 	mq->first = 0;
 	mq->msgCount = count;
 	mq->msg = msg;
+}
+
+extern OSMesgQueue gSYSchedulerTaskMesgQueue;
+
+void port_send_scheduler_interrupt(u32 code)
+{
+	osSendMesg(&gSYSchedulerTaskMesgQueue, (OSMesg)(uintptr_t)code, OS_MESG_NOBLOCK);
 }
 
 s32 osSendMesg(OSMesgQueue *mq, OSMesg msg, s32 flag)
@@ -583,9 +616,22 @@ void osSpTaskStartGo(OSTask *tp)
 		return;
 	}
 
-	if (sTaskGoCount <= 60 || (sTaskGoCount % 60 == 0)) {
-		port_log("SSB64: osSpTaskStartGo #%d type=%d data_ptr=%p\n",
-		         (int)sTaskGoCount, (int)tp->t.type, (void *)tp->t.data_ptr);
+#if defined(__EMSCRIPTEN__)
+	/* Taking &owner->task while owner is NULL produces a small non-NULL
+	 * pointer.  Native builds often turn that into a late, opaque crash;
+	 * Emscripten also stores through the NULL owner and damages its stack
+	 * cookie.  Keep the web diagnostic build alive and report the real
+	 * scheduler error before dereferencing the bogus task. */
+	if ((uintptr_t)tp < 4096u) {
+		port_log("SSB64: osSpTaskStartGo #%d — invalid low task pointer=%p\n",
+		         (int)sTaskGoCount, (void *)tp);
+		return;
+	}
+#endif
+
+	if (sTaskGoCount == 1) {
+		port_log("SSB64: osSpTaskStartGo #%d task=%p type=%d data_ptr=%p\n",
+		         (int)sTaskGoCount, (void *)tp, (int)tp->t.type, (void *)tp->t.data_ptr);
 	}
 
 	if (tp->t.type == M_GFXTASK && tp->t.data_ptr != NULL) {

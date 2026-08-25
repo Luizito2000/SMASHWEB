@@ -1550,21 +1550,6 @@ extern "C" void portRelocFixupTextureAtRuntime(const void *addr, unsigned int nu
 		return;
 	}
 
-	static unsigned int sRuntimeTexTraceCount = 0;
-	if (sRuntimeTexTraceCount < 512)
-	{
-		uintptr_t descBase = 0;
-		size_t descSize = 0;
-		unsigned int descFileId = 0;
-		const char *descPath = nullptr;
-		int described = portRelocDescribePointer(addr, &descBase, &descSize, &descFileId, &descPath);
-		port_log("SSB64: runtimeTexFix addr=%p req=0x%x fileBase=%p fileSize=0x%zx off=0x%zx num=0x%x desc=%d file=%u descBase=%p descSize=0x%zx path=%s\n",
-		         addr, num_bytes, (void*)fileBase, fileSize, target_offset, num_bytes,
-		         described, descFileId, (void*)descBase,
-		         descSize, descPath ? descPath : "(unknown)");
-		sRuntimeTexTraceCount++;
-	}
-
 	/* Clamp the swap at the first tokenized reloc chain slot in the range.
 	 *
 	 * N64 LoadBlock/LoadTLUT legitimately over-read past the true texel

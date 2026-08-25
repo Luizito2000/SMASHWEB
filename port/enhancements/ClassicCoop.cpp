@@ -27,7 +27,14 @@ static int sClassicCoopLatched = -1;
 static int sClassicCoopContext = 0;
 
 extern "C" void port_classic_coop_latch(void) {
+#if defined(__EMSCRIPTEN__)
+    // Keep the browser's default 1P flow faithful to the original game.
+    // Classic co-op can be reintroduced as an explicit web/netplay mode, but
+    // it must not redirect the normal 1P button into the VS character screen.
+    sClassicCoopLatched = 0;
+#else
     sClassicCoopLatched = CVarGetInteger(ssb64::enhancements::ClassicCoopCVarName(), 1) != 0;
+#endif
 }
 
 extern "C" int port_enhancement_classic_coop(void) {

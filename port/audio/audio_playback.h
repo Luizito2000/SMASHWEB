@@ -15,6 +15,13 @@ void portAudioPushSilence(void);
 // Total bytes submitted = sampleCount * 2 (channels) * 2 (bytes per s16).
 void portAudioSubmitFrame(const void *buf, int sampleCount);
 
+// Web only: deliver the PCM saved by the cooperative N64 audio fiber from
+// the browser's main loop, where SDL/WebAudio calls are permitted.
+void portAudioPumpWeb(void);
+
+// Publish the web PCM buffer addresses once before cooperative fibers start.
+void portAudioInstallWebBridge(void);
+
 #ifdef __cplusplus
 }
 #endif

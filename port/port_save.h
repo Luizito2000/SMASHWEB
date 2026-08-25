@@ -28,6 +28,10 @@ int port_save_read(uintptr_t offset, void *dst, size_t size);
 // Returns 0 on success, -1 on I/O error.
 int port_save_write(uintptr_t offset, const void *src, size_t size);
 
+// Web only: load the SRAM image from browser storage and publish the memory
+// buffer used for asynchronous persistence. It is a no-op on native builds.
+void port_save_install_web_bridge(void);
+
 #ifdef __cplusplus
 }
 #endif

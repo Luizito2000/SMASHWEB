@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.24.0 FATAL_ERROR)
 
 project(ssb64 LANGUAGES C CXX)
 
+if(EMSCRIPTEN)
+    # Shared-memory Wasm requires atomics/bulk-memory on every linked object,
+    # including targets created later by dependency subdirectories.
+    add_compile_options("SHELL:-pthread")
+endif()
+
 # Android needs ASM for the aarch64 coroutine context-switch
 # (port/coroutine_aarch64.S). Enable it before any add_library/add_executable
 # call sees an .S source. ASM is preprocessed by clang on the way through.
@@ -15,7 +21,7 @@ endif()
 # and the in-engine call sites (#ifndef DISABLE_SCRIPTING). Forced ON for
 # Android: funchook/TinyCC have no Android target and the loader is desktop-only.
 # Set BEFORE add_subdirectory(libultraship) so the engine half sees it too.
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME STREQUAL "Android" OR EMSCRIPTEN)
     set(DISABLE_SCRIPTING ON CACHE BOOL "Disable the mod system (scripting + hooks)" FORCE)
 endif()
 
@@ -126,7 +132,7 @@ set(GBI_UCODE "F3DEX_GBI_2" CACHE STRING "" FORCE)
 # Android needs GLES3 instead of desktop GL + GLEW. Pin USE_OPENGLES ON
 # before the libultraship subdirectory so its src/CMakeLists.txt picks the
 # GLESv3 branch and the ENABLE_OPENGL/USE_OPENGLES compile defs are set.
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME STREQUAL "Android" OR EMSCRIPTEN)
     set(USE_OPENGLES ON CACHE BOOL "" FORCE)
 endif()
 
@@ -219,6 +225,17 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     # was forced above). The libtorch_runner.so SHARED library at the
     # bottom of this file wraps it for JNI.
     add_subdirectory(torch ${CMAKE_BINARY_DIR}/torch)
+elseif(DEFINED SSB64_HOST_TORCH_EXECUTABLE AND EXISTS "${SSB64_HOST_TORCH_EXECUTABLE}")
+    # Reuse an already-built native Torch extractor for secondary web build
+    # directories. This keeps local diagnostic builds offline and avoids
+    # rebuilding the host-only asset tool just to produce another wasm output.
+    add_custom_target(TorchExternal)
+    set(TORCH_EXECUTABLE "${SSB64_HOST_TORCH_EXECUTABLE}")
+    if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+        set(TORCH_SIDECAR_NAME torch.exe)
+    else()
+        set(TORCH_SIDECAR_NAME torch)
+    endif()
 else()
     # Desktop: build Torch as a host executable via ExternalProject so it
     # can run at our build time to extract ROM assets.
@@ -227,6 +244,7 @@ else()
         SOURCE_DIR ${CMAKE_SOURCE_DIR}/torch
         CMAKE_ARGS
             -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/torch-install
+            -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
             -DUSE_STANDALONE=ON
             -DBUILD_STORMLIB=OFF
             -DBUILD_SM64=OFF
@@ -240,7 +258,7 @@ else()
     )
 
     ExternalProject_Get_Property(TorchExternal install_dir)
-    if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
         # Torch is built via ExternalProject_Add and inherits the parent generator.
         # Multi-config generators (Visual Studio) place the binary under <CONFIG>/;
         # single-config generators (Ninja, NMake) drop it directly in the build dir.
@@ -467,7 +485,7 @@ list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/coroutine_test\\.cpp$")
 if (DISABLE_SCRIPTING)
     list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/mods/")
 endif()
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME STREQUAL "Android" OR EMSCRIPTEN)
     # libtorch_runner.so wraps android_torch_bridge.cpp separately; keep
     # it out of libmain.so so the static libtorch + its FetchContent'd
     # deps don't bloat the SDL-bound game library.
@@ -484,7 +502,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android")
 endif()
 # Treat the generated icon header as a source so CMake schedules it ahead
 # of any port TU compilation (port_window_icon.cpp #includes it).
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android" AND NOT EMSCRIPTEN)
     list(APPEND SSB64_SRC_PORT ${SSB64_ICON_GEN})
 endif()
 # Arrow baked headers — added as sources so CMake schedules their generation
@@ -766,7 +784,7 @@ endif()
 # Fetch Discord RPC (desktop only — Android drops Discord Rich Presence
 # along with the rest of the network-dependent features).
 ################################################################################
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android" AND NOT EMSCRIPTEN)
     # discord-rpc v3.4.0's CMakeLists declares cmake_minimum_required(VERSION 2.x),
     # which CMake 3.30+ refuses to honor. Force a baseline policy version for the
     # fetched subdir so the build still configures with current CMake.
@@ -826,6 +844,47 @@ else()
     # but the produced executable is `${SSB64_APP_NAME}` — `BattleShip`
     # (US) or `BattleShip-JP` (JP), so the two are distinct applications.
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${SSB64_APP_NAME}")
+    if (EMSCRIPTEN)
+        option(SSB64_WEB_RAPHNET_DIRECT "Enable the experimental WebHID Raphnet Direct bridge" OFF)
+        option(SSB64_WEB_AUDIO
+            "Enable experimental N64 audio synthesis inside the web coroutine"
+            OFF)
+        set(SSB64_WEB_OUTPUT_NAME "${SSB64_APP_NAME}" CACHE STRING
+            "Browser output basename (useful for side-by-side local test builds)")
+        set_target_properties(${PROJECT_NAME} PROPERTIES
+            OUTPUT_NAME "${SSB64_WEB_OUTPUT_NAME}"
+            SUFFIX ".html"
+        )
+        target_compile_definitions(${PROJECT_NAME} PRIVATE __WEB__)
+        if (SSB64_WEB_AUDIO)
+            # audio.c belongs to the decomp object library, while the browser
+            # bridge belongs to the final executable. Both need the same flag.
+            target_compile_definitions(ssb64_game PRIVATE SSB64_WEB_AUDIO=1)
+            target_compile_definitions(${PROJECT_NAME} PRIVATE SSB64_WEB_AUDIO=1)
+        endif()
+        target_compile_options(${PROJECT_NAME} PRIVATE "SHELL:-pthread")
+        target_link_options(${PROJECT_NAME} PRIVATE
+            "SHELL:-sUSE_SDL=2"
+            "SHELL:-sUSE_WEBGL2=1"
+            "SHELL:-sALLOW_MEMORY_GROWTH=1"
+            "SHELL:-sASYNCIFY=1"
+            "SHELL:-pthread"
+            # BattleShip creates twelve long-lived worker threads during boot.
+            # Pre-warming the full pool avoids late worker creation, browser
+            # warnings, and possible stalls on lower-end machines.
+            "SHELL:-sPTHREAD_POOL_SIZE=12"
+            "SHELL:--pre-js ${CMAKE_SOURCE_DIR}/web/fullscreen_control.js"
+        )
+        set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY
+            LINK_DEPENDS "${CMAKE_SOURCE_DIR}/web/fullscreen_control.js")
+        if (SSB64_WEB_RAPHNET_DIRECT)
+            target_compile_definitions(${PROJECT_NAME} PRIVATE SSB64_WEB_RAPHNET_DIRECT=1)
+            target_link_options(${PROJECT_NAME} PRIVATE
+                "SHELL:--pre-js ${CMAKE_SOURCE_DIR}/web/raphnet_webhid.js")
+            set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY
+                LINK_DEPENDS "${CMAKE_SOURCE_DIR}/web/raphnet_webhid.js")
+        endif()
+    endif()
 endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
@@ -856,7 +915,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/debug_tools
     ${SSB64_CSS_GEN_DIR}                         # CSS icon baked headers (arrow_data.h)
 )
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android" AND NOT EMSCRIPTEN)
     target_include_directories(${PROJECT_NAME} PRIVATE
         ${SSB64_ICON_GEN_DIR}                         # Generated icon header (port_icon_data.h)
         ${discord_rpc_SOURCE_DIR}/include             # Discord Rich Presence
@@ -875,6 +934,9 @@ endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     add_dependencies(${PROJECT_NAME} libultraship)
+    target_link_libraries(${PROJECT_NAME} PRIVATE libultraship)
+elseif (EMSCRIPTEN)
+    add_dependencies(${PROJECT_NAME} libultraship TorchExternal)
     target_link_libraries(${PROJECT_NAME} PRIVATE libultraship)
 else()
     add_dependencies(${PROJECT_NAME} libultraship TorchExternal discord-rpc)
@@ -1191,6 +1253,21 @@ endif()
 set(SSB64_O2R_DIR ${CMAKE_BINARY_DIR}/extracted)
 set(SSB64_O2R     ${SSB64_O2R_DIR}/BattleShip.o2r)
 
+# Browser builds cannot read sidecar files from the host directory directly.
+# Package the vanilla game data and required runtime resources into Emscripten's
+# virtual filesystem. The source ROM itself is deliberately never included.
+if(EMSCRIPTEN)
+    target_link_options(${PROJECT_NAME} PRIVATE
+        "SHELL:--preload-file ${SSB64_O2R}@/BattleShip.o2r"
+        "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/f3d.o2r@/f3d.o2r"
+        "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/gamecontrollerdb.txt@/gamecontrollerdb.txt"
+        "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/config.yml@/config.yml"
+        "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/assets/custom@/assets/custom"
+        "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/yamls/${SSB64_VERSION}@/yamls/${SSB64_VERSION}"
+        "SHELL:--preload-file ${CMAKE_BINARY_DIR}/assets/css_icons@/assets/css_icons"
+    )
+endif()
+
 # Two configurations:
 #
 #   (a) Baserom present (typical dev / Torch-extract first-run): declare the
@@ -1242,6 +1319,28 @@ else()
         COMMENT "ExtractAssets stub — baserom missing"
     )
     message(STATUS "BattleShip.o2r: baserom absent — ExtractAssets stub installed")
+endif()
+
+if(EMSCRIPTEN AND SSB64_WEB_AUDIO AND EXISTS "${SSB64_BASEROM}")
+    # The ResourceManager uses worker-backed archive reads. Calling it from
+    # the emulated N64 audio fiber can deadlock the browser main thread, so
+    # expose just the eight audio blobs as ordinary synchronous MEMFS files.
+    set(SSB64_WEB_AUDIO_DIR ${CMAKE_BINARY_DIR}/web_audio)
+    set(SSB64_WEB_AUDIO_STAMP ${SSB64_WEB_AUDIO_DIR}/.ready)
+    add_custom_command(
+        OUTPUT ${SSB64_WEB_AUDIO_STAMP}
+        DEPENDS ${SSB64_O2R} ${CMAKE_SOURCE_DIR}/tools/extract_web_audio.py
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${SSB64_WEB_AUDIO_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/extract_web_audio.py
+            --archive ${SSB64_O2R}
+            --output ${SSB64_WEB_AUDIO_DIR}
+        COMMAND ${CMAKE_COMMAND} -E touch ${SSB64_WEB_AUDIO_STAMP}
+        COMMENT "Extracting synchronous web audio assets"
+    )
+    add_custom_target(WebAudioAssets DEPENDS ${SSB64_WEB_AUDIO_STAMP})
+    add_dependencies(${PROJECT_NAME} WebAudioAssets)
+    target_link_options(${PROJECT_NAME} PRIVATE
+        "SHELL:--preload-file ${SSB64_WEB_AUDIO_DIR}@/web_audio")
 endif()
 
 add_custom_target(GenerateBattleShipO2R

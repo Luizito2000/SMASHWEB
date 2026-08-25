@@ -23,6 +23,10 @@
 #include <cstring>
 #include <cmath>
 
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
+
 // SSB64 original output rate is 32 kHz.
 // At 60 fps that's ~533 samples/frame. We use the same high/low watermarks
 // as Starship to keep the audio player's ring buffer comfortably filled.
@@ -35,6 +39,48 @@ static constexpr int32_t MAX_SAMPLES_STEREO = SAMPLES_PER_FRAME_HIGH * 2;
 // Persistent silence buffer — zeroed once, reused every frame.
 static int16_t sSilenceBuf[MAX_SAMPLES_STEREO];
 static bool    sInitialized = false;
+
+#if defined(__EMSCRIPTEN__)
+static uint8_t sWebPendingAudio[0x4000];
+static uint32_t sWebPendingAudioBytes = 0;
+static uint32_t sWebPendingAudioSequence = 0;
+
+#if defined(SSB64_WEB_AUDIO)
+extern "C" void syAudioPumpWeb(void);
+#endif
+
+static void queueWebAudio(const void* data, size_t byteLen)
+{
+    if (byteLen > sizeof(sWebPendingAudio)) {
+        byteLen = sizeof(sWebPendingAudio);
+    }
+    std::memcpy(sWebPendingAudio, data, byteLen);
+    sWebPendingAudioBytes = static_cast<uint32_t>(byteLen);
+    ++sWebPendingAudioSequence;
+}
+
+extern "C" void portAudioInstallWebBridge(void)
+{
+    EM_ASM({ globalThis.BattleShipInstallWebAudioBridge($0, $1, $2); },
+           sWebPendingAudio,
+           &sWebPendingAudioBytes,
+           &sWebPendingAudioSequence);
+}
+
+extern "C" void portAudioPumpWeb(void)
+{
+#if defined(SSB64_WEB_AUDIO)
+    // The mixer itself is deliberately outside the Asyncify audio coroutine.
+    // It produces one current 32 kHz PCM block; the pre-js bridge hands that
+    // block to the browser AudioContext without scheduling stale backlog.
+    syAudioPumpWeb();
+#endif
+}
+
+#else
+extern "C" void portAudioPumpWeb(void) {}
+extern "C" void portAudioInstallWebBridge(void) {}
+#endif
 
 extern "C" void portAudioPushSilence(void)
 {
@@ -71,7 +117,11 @@ extern "C" void portAudioPushSilence(void)
         byteLen = sizeof(sSilenceBuf);
     }
 
+#if defined(__EMSCRIPTEN__)
+    queueWebAudio(sSilenceBuf, byteLen);
+#else
     AudioPlayerPlayFrame(reinterpret_cast<const uint8_t*>(sSilenceBuf), byteLen);
+#endif
 }
 
 /* ---------------------------------------------------------------------- */
@@ -166,6 +216,14 @@ static bool outputFilterEnabled()
 
 static const int16_t* applyOutputFilter(const int16_t* input, int sampleCount)
 {
+#if defined(__EMSCRIPTEN__)
+    /* The optional desktop low-pass relies on libm rounding for every PCM
+     * sample.  In the browser build that path can stall the main WebAssembly
+     * thread before the first frame is presented. WebAudio already resamples
+     * the native 32 kHz stream, so publish the original PCM unchanged. */
+    (void)sampleCount;
+    return input;
+#else
     /* 32 kHz N64 output lands close to Nyquist on the intro's highest notes.
      * This light 14.5 kHz Butterworth stage mimics the final output chain's
      * anti-imaging rolloff without touching the actual mixer/resampler math. */
@@ -201,6 +259,7 @@ static const int16_t* applyOutputFilter(const int16_t* input, int sampleCount)
     }
 
     return sFilteredBuf;
+#endif
 }
 
 extern "C" void portAudioSubmitFrame(const void *buf, int sampleCount)
@@ -230,7 +289,9 @@ extern "C" void portAudioSubmitFrame(const void *buf, int sampleCount)
                 sLoggedNonzero = true;
                 port_log("SSB64 Audio: first non-zero sample detected (idx=%zu v=%d)\n",
                          i, (int)s[i]);
+#if !defined(__EMSCRIPTEN__)
                 wavMaybeOpen();
+#endif
                 break;
             }
         }
@@ -238,7 +299,10 @@ extern "C" void portAudioSubmitFrame(const void *buf, int sampleCount)
     const int16_t* pcm = reinterpret_cast<const int16_t*>(buf);
     pcm = applyOutputFilter(pcm, sampleCount);
 
+#if defined(__EMSCRIPTEN__)
+    queueWebAudio(pcm, byteLen);
+#else
     wavAppend(pcm, byteLen);
-
     AudioPlayerPlayFrame(reinterpret_cast<const uint8_t*>(pcm), byteLen);
+#endif
 }

@@ -22,6 +22,9 @@
 #include <functional>
 #include <typeinfo>
 #include <unordered_set>
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>
+#endif
 
 #include "resource/ResourceType.h"
 #include "resource/RelocFileFactory.h"
@@ -30,6 +33,7 @@
 
 #include "app_paths.h"
 #include "bridge/audio_bridge.h"
+#include "audio/audio_playback.h"
 #include "bridge/framebuffer_capture.h"
 #include "enhancements/enhancements.h"
 #include "first_run.h"
@@ -38,7 +42,7 @@
 #include "hires/HiResHook.h"
 #include "hires/HiResPack.h"
 #endif
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
 #include "port_window_icon.h"
 #endif
 #if defined(__ANDROID__)
@@ -50,6 +54,7 @@
 #endif
 #include "renderdoc_trigger.h"
 #include "port_log.h"
+#include "port_save.h"
 #include "fighter_registry.h"
 #include "focus.h"
 
@@ -59,6 +64,7 @@
 #endif
 
 extern "C" void PortRegisterEvents(void);
+extern "C" int port_get_frame_count(void);
 
 #ifndef DISABLE_SCRIPTING
 /* Force the linker to pull bridge .obj files into the EXE so their
@@ -900,7 +906,7 @@ static int PortInitImpl(int argc, char* argv[]) {
 			port_log("SSB64: Port menu attached\n");
 		}
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
 		// Linux: WMs only show the app icon if SDL_SetWindowIcon is called
 		// on the live window. .ico/.icns paths are baked into the .exe /
 		// .app on Windows / macOS so this is a no-op there. Android pulls
@@ -918,7 +924,14 @@ static int PortInitImpl(int argc, char* argv[]) {
 	// the 1P stage-clear frozen-wallpaper capture (issue #57) and the VS
 	// match -> results-screen photo wipe (issue #81). Cost is one extra
 	// full-screen blit per frame (sub-millisecond on any modern GPU).
+#ifdef __EMSCRIPTEN__
+	// The desktop GUI composites this off-screen framebuffer into its
+	// "Main Game" ImGui window. The first web target intentionally runs
+	// without that desktop GUI, so render directly to the browser canvas.
+	port_capture_set_force_render_to_fb(0);
+#else
 	port_capture_set_force_render_to_fb(1);
+#endif
 
 	// FileDropMgr must come up before the first-run wizard so SDL_DROPFILE
 	// events landing on the window during the wizard frame loop can be
@@ -1006,6 +1019,12 @@ static int PortInitImpl(int argc, char* argv[]) {
 		 * shows up as broadband noise in the output. */
 		Ship::AudioSettings audio;
 		audio.SampleRate = 32000;
+#if defined(__EMSCRIPTEN__)
+		/* WebAudio is fed directly from PortWebMainLoop.  SDL's browser audio
+		 * worker performs proxied JS calls that conflict with our cooperative
+		 * Asyncify N64 fibers, so keep libultraship on its null device here. */
+		sContext->GetConfig()->SetCurrentAudioBackend(Ship::AudioBackend::NUL);
+#endif
 		if (!sContext->InitAudio(audio)) { port_log("SSB64: InitAudio failed\n"); return 1; }
 		port_log("SSB64: Audio initialized at %d Hz\n", (int)audio.SampleRate);
 	}
@@ -1213,6 +1232,93 @@ int PortIsRunning(void) {
 
 } // extern "C"
 
+#if defined(__EMSCRIPTEN__)
+static int sWebArgc = 0;
+static char** sWebArgv = nullptr;
+static bool sWebInitialized = false;
+static int sWebSnapshotMode = -1;
+static bool sWebAudioTrace = false;
+static bool sWebDebugStaffroll = false;
+static bool sWebDebugMaps = false;
+extern "C" void syAudioSetWebEnabled(int enabled);
+extern "C" void syAudioSetWebTraceEnabled(int enabled);
+extern "C" void WebGamepadInstallBridge(void);
+
+/* Read by scmanager.c after the normal boot data is ready.  Keeping the URL
+ * access here (on the browser main loop) avoids JavaScript calls from an N64
+ * coroutine. */
+extern "C" int port_web_debug_staffroll_requested(void) {
+	return sWebDebugStaffroll ? 1 : 0;
+}
+
+extern "C" int port_web_debug_maps_requested(void) {
+	return sWebDebugMaps ? 1 : 0;
+}
+
+static void PortWebMainLoop(void) {
+	if (!sWebInitialized) {
+		const int webAudioEnabled = EM_ASM_INT({
+			return new URLSearchParams(window.location.search).get('audio') === '0' ? 0 : 1;
+		});
+		sWebAudioTrace = EM_ASM_INT({
+			return new URLSearchParams(window.location.search).get('audioTrace') === '1' ? 1 : 0;
+		}) != 0;
+		sWebDebugStaffroll = EM_ASM_INT({
+			return new URLSearchParams(window.location.search).get('debugStaffroll') === '1' ? 1 : 0;
+		}) != 0;
+		sWebDebugMaps = EM_ASM_INT({
+			return new URLSearchParams(window.location.search).get('debugMaps') === '1' ? 1 : 0;
+		}) != 0;
+		syAudioSetWebEnabled(webAudioEnabled);
+		syAudioSetWebTraceEnabled(sWebAudioTrace ? 1 : 0);
+		if (sWebAudioTrace) {
+			port_log("SSB64 AUDIO TRACE enabled: records first 360 ticks, then every 60 ticks\n");
+		}
+		if (PortInit(sWebArgc, sWebArgv) != 0) {
+			emscripten_cancel_main_loop();
+			return;
+		}
+		portAudioInstallWebBridge();
+		WebGamepadInstallBridge();
+		port_save_install_web_bridge();
+		PortGameInit();
+		sWebInitialized = true;
+		return;
+	}
+	if (!WindowIsRunning()) {
+		emscripten_cancel_main_loop();
+		PortGameShutdown();
+		PortShutdown();
+		portRenderDocShutdown();
+		return;
+	}
+	const int traceFrameBefore = port_get_frame_count();
+	if (sWebAudioTrace && (traceFrameBefore < 360 || (traceFrameBefore % 60) == 0)) {
+		port_log("SSB64 AUDIO TRACE web-frame-begin frame=%d\n", traceFrameBefore);
+	}
+	PortPushFrame();
+	if (sWebAudioTrace && (traceFrameBefore < 360 || (traceFrameBefore % 60) == 0)) {
+		port_log("SSB64 AUDIO TRACE web-frame-after-graphics frame=%d now=%d\n",
+		         traceFrameBefore, port_get_frame_count());
+	}
+	portAudioPumpWeb();
+	if (sWebAudioTrace && (traceFrameBefore < 360 || (traceFrameBefore % 60) == 0)) {
+		port_log("SSB64 AUDIO TRACE web-frame-end frame=%d\n", port_get_frame_count());
+	}
+	if (sWebSnapshotMode < 0) {
+		sWebSnapshotMode = EM_ASM_INT({
+			return new URLSearchParams(window.location.search).get('snapshot') === '1' ? 1 : 0;
+		});
+	}
+	if (sWebSnapshotMode) {
+		if (port_get_frame_count() >= 20) {
+			port_log("SSB64: web snapshot mode paused after 20 frames\n");
+			emscripten_cancel_main_loop();
+		}
+	}
+}
+#endif
+
 int main(int argc, char* argv[]) {
 	/* Use an absolute path for ssb64.log so it lands in a predictable
 	 * place regardless of how the binary was launched (Finder / open /
@@ -1273,6 +1379,15 @@ int main(int argc, char* argv[]) {
 	// can hook D3D11 before LUS creates the device.
 	portRenderDocInit();
 
+#if defined(__EMSCRIPTEN__)
+	sWebArgc = argc;
+	sWebArgv = argv;
+	// Register requestAnimationFrame before SDL/window/game initialization.
+	// This lets browser workers finish starting and gives SDL a valid main
+	// loop when it configures presentation timing.
+	emscripten_set_main_loop(PortWebMainLoop, 0, 1);
+	return 0;
+#else
 	if (PortInit(argc, argv) != 0) {
 		return 1;
 	}
@@ -1410,4 +1525,5 @@ int main(int argc, char* argv[]) {
 		port_log_close();
 		return 1;
 	}
+#endif
 }

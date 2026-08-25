@@ -10,6 +10,10 @@
 #include <mutex>
 #include <string>
 
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>
+#endif
+
 // Where the SRAM file lives, in priority order:
 //
 //   1. $SSB64_SAVE_PATH                  — explicit override (debug / CI).
@@ -29,6 +33,16 @@
 //   4. "ssb64_save.bin" in cwd                               — last-resort.
 
 namespace {
+
+#if defined(__EMSCRIPTEN__)
+// Browser builds keep the complete N64 SRAM image in linear memory. Calling
+// browser APIs from the cooperative game coroutine can conflict with
+// Asyncify, so writes only bump a sequence number; pre-js persists a snapshot
+// from requestAnimationFrame/pagehide on the browser main loop.
+constexpr size_t kWebSaveSize = PORT_SAVE_SIZE;
+unsigned char gWebSaveData[kWebSaveSize] = {};
+uint32_t gWebSaveSequence = 0;
+#endif
 
 std::once_flag gPathOnce;
 std::string gSavePath;
@@ -65,15 +79,40 @@ const std::string &savePath()
 
 } // namespace
 
+extern "C" void port_save_install_web_bridge(void)
+{
+#if defined(__EMSCRIPTEN__)
+    // This is called before PortGameInit starts any cooperative N64 fibers, so
+    // the one synchronous JS hop used to restore localStorage is safe.
+    EM_ASM({
+        if (typeof globalThis.BattleShipInstallWebSaveBridge === 'function') {
+            globalThis.BattleShipInstallWebSaveBridge($0, $1, $2);
+        }
+    }, gWebSaveData, static_cast<int>(kWebSaveSize), &gWebSaveSequence);
+#endif
+}
+
 extern "C" const char *port_save_get_path(void)
 {
+#if defined(__EMSCRIPTEN__)
+    return "browser-local-storage";
+#else
     return savePath().c_str();
+#endif
 }
 
 extern "C" int port_save_read(uintptr_t offset, void *dst, size_t size)
 {
     if (size == 0) return 0;
     std::memset(dst, 0, size);
+
+#if defined(__EMSCRIPTEN__)
+    if (offset < kWebSaveSize) {
+        const size_t available = kWebSaveSize - static_cast<size_t>(offset);
+        std::memcpy(dst, gWebSaveData + offset, size < available ? size : available);
+    }
+    return 0;
+#else
 
     FILE *f = std::fopen(savePath().c_str(), "rb");
     if (f == NULL) {
@@ -86,11 +125,21 @@ extern "C" int port_save_read(uintptr_t offset, void *dst, size_t size)
     (void)std::fread(dst, 1, size, f);
     std::fclose(f);
     return 0;
+#endif
 }
 
 extern "C" int port_save_write(uintptr_t offset, const void *src, size_t size)
 {
     if (size == 0) return 0;
+
+#if defined(__EMSCRIPTEN__)
+    if (offset >= kWebSaveSize) return -1;
+    const size_t available = kWebSaveSize - static_cast<size_t>(offset);
+    const size_t count = size < available ? size : available;
+    std::memcpy(gWebSaveData + offset, src, count);
+    ++gWebSaveSequence;
+    return count == size ? 0 : -1;
+#else
 
     const char *path = savePath().c_str();
 
@@ -133,4 +182,5 @@ extern "C" int port_save_write(uintptr_t offset, const void *src, size_t size)
         return -1;
     }
     return 0;
+#endif
 }

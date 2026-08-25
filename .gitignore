@@ -2,6 +2,10 @@
 build/
 build-*/
 cmake-build-*/
+webap/
+webtrace/
+*.log
+*.error.log
 dist/
 .vs/
 .idea/

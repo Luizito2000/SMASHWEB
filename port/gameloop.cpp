@@ -82,29 +82,12 @@ extern OSMesgQueue gSYSchedulerTaskMesgQueue;
 /* VI retrace interrupt value (matches scheduler.c local define). */
 #define INTR_VRETRACE 1
 
-} /* extern "C" */
+/* Keep OSMesg construction on the C/decomp side.  libultraship exposes
+ * OSMesg as a union while PR/os.h exposes it as void*; on wasm32 those
+ * otherwise-compatible native declarations use different call ABIs. */
+void port_send_scheduler_interrupt(uint32_t code);
 
-/*
- * port_make_os_mesg_int() — fully-initialised OSMesg from an integer code.
- *
- * The decomp treats OSMesg as `void*` (PR/os.h); libultraship treats it as a
- * union { u8; u16; u32; void*; } (libultraship/libultra/message.h). Both are
- * 8 bytes, so the calling convention matches, but writing only one union
- * member from C++ leaves the remaining bytes uninitialised — whatever was on
- * the stack in that slot. On MSVC/x64 those bytes happened to be zero and
- * the bug was latent; on macOS/arm64 they held a stack pointer, and the
- * scheduler's `(SYTaskInfo*)mesg` cast in sySchedulerThreadMain then jumped
- * through a garbage `fnCheck` pointer.
- *
- * All port-layer (C++) sends of integer interrupt codes should go through
- * this helper so the full 8 bytes are well-defined on every platform.
- */
-static inline OSMesg port_make_os_mesg_int(uint32_t code)
-{
-	OSMesg m{};          /* zero-initialise every union member */
-	m.data32 = code;     /* then set the scalar we care about */
-	return m;
-}
+} /* extern "C" */
 
 /* ========================================================================= */
 /*  Game coroutine state                                                     */
@@ -709,10 +692,8 @@ void PortPushFrame(void)
 	 * delivered before the next game tick can tear down scene memory. */
 	port_vi_simulate_vblank();
 
-	/* Post a VI retrace event to the scheduler's message queue. See
-	 * port_make_os_mesg_int() above for why we don't just write
-	 * `(OSMesg)INTR_VRETRACE` here. */
-	osSendMesg(&gSYSchedulerTaskMesgQueue, port_make_os_mesg_int(INTR_VRETRACE), OS_MESG_NOBLOCK);
+	/* Post a VI retrace event through the C/decomp ABI. */
+	port_send_scheduler_interrupt(INTR_VRETRACE);
 
 	/* TCC mod hook: GamePreUpdateEvent fires once per frame BEFORE the
 	 * per-frame coroutine resume. Listeners run on the main thread with
@@ -732,7 +713,7 @@ void PortPushFrame(void)
 	port_enhancement_stage_hazards_tick();
 	port_widescreen_tick();
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
 	ssb64::enhancements::TickDiscordPresence(); // DRP
 #endif
 
@@ -829,6 +810,7 @@ void PortPushFrame(void)
 			}
 
 			if (!idlePresented) {
+#if !defined(__EMSCRIPTEN__)
 				/* Fallback pace to one VI period if there is no cached
 				 * framebuffer yet. Normal idle presents pace through the
 				 * backend's SwapBuffers path. */
@@ -841,6 +823,7 @@ void PortPushFrame(void)
 				while (std::chrono::steady_clock::now() < target) {
 					/* busy-wait */
 				}
+#endif
 			}
 		}
 	}
@@ -870,7 +853,7 @@ void PortPushFrame(void)
 		static auto sStartTime = std::chrono::steady_clock::now();
 		auto now = std::chrono::steady_clock::now();
 		double elapsed = std::chrono::duration<double>(now - sStartTime).count();
-		if (sFrameCount <= 60 || (sFrameCount % 60 == 0)) {
+		if (sFrameCount == 1 || (sFrameCount % 300 == 0)) {
 			port_log("SSB64: Frame %d complete (t=%.2fs)\n", sFrameCount, elapsed);
 		}
 	}

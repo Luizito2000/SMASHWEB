@@ -1,0 +1,45 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "web-debug",
+      "displayName": "BattleShip Web (Debug)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-web",
+      "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CROSSCOMPILING_EMULATOR": "$env{EMSDK_NODE}",
+        "DISABLE_SCRIPTING": "ON",
+        "SSB64_VERSION": "us",
+        "USE_AUTO_VCPKG": "OFF"
+      }
+    },
+    {
+      "name": "web-release",
+      "displayName": "BattleShip Web (Release)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-web-release",
+      "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CROSSCOMPILING_EMULATOR": "$env{EMSDK_NODE}",
+        "DISABLE_SCRIPTING": "ON",
+        "SSB64_VERSION": "us",
+        "SSB64_HOST_TORCH_EXECUTABLE": "${sourceDir}/build-web/TorchExternal/src/TorchExternal-build/torch.exe",
+        "SSB64_WEB_RAPHNET_DIRECT": "OFF",
+        "USE_AUTO_VCPKG": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "web-debug",
+      "configurePreset": "web-debug"
+    },
+    {
+      "name": "web-release",
+      "configurePreset": "web-release"
+    }
+  ]
+}
