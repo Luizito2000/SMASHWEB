@@ -246,35 +246,59 @@
           present.add(pad.index);
           const id = String(pad.id || "");
           const lowerId = id.toLowerCase();
-          const raphnet = lowerId.includes("raphnet") || lowerId.includes("289b");
+          const raphnet = lowerId.includes("raphnet") || lowerId.includes("289b") ||
+                          lowerId.includes("1781") || lowerId.includes("1740") ||
+                          lowerId.includes("n64") || lowerId.includes("retro");
           const hasActivity = pad.buttons.some((button) => button && button.pressed) ||
-            pad.axes.some((value) => Number.isFinite(value) && Math.abs(value) > 0.08);
+            pad.axes.some((value) => Number.isFinite(value) && Math.abs(value) > 0.15);
           if (raphnet && hasActivity) activeRaphnetGamepads.add(pad.index);
           if (raphnet && !activeRaphnetGamepads.has(pad.index)) continue;
 
           let mask = 0;
           if (raphnet) {
-            mask = set(mask, down(pad, 0), 0x8000); mask = set(mask, down(pad, 1), 0x4000);
-            mask = set(mask, down(pad, 2), 0x2000); mask = set(mask, down(pad, 3), 0x1000);
-            mask = set(mask, down(pad, 4), 0x0020); mask = set(mask, down(pad, 5), 0x0010);
-            mask = set(mask, down(pad, 6), 0x0008); mask = set(mask, down(pad, 7), 0x0004);
-            mask = set(mask, down(pad, 8), 0x0002); mask = set(mask, down(pad, 9), 0x0001);
-            mask = set(mask, down(pad, 10), 0x0800); mask = set(mask, down(pad, 11), 0x0400);
-            mask = set(mask, down(pad, 12), 0x0200); mask = set(mask, down(pad, 13), 0x0100);
+            mask = set(mask, down(pad, 0), 0x8000); // A
+            mask = set(mask, down(pad, 1), 0x4000); // B
+            mask = set(mask, down(pad, 2), 0x2000); // Z
+            mask = set(mask, down(pad, 3), 0x1000); // Start
+            mask = set(mask, down(pad, 4), 0x0020); // L
+            mask = set(mask, down(pad, 5), 0x0010); // R
+            mask = set(mask, down(pad, 6), 0x0008); // C-Up
+            mask = set(mask, down(pad, 7), 0x0004); // C-Down
+            mask = set(mask, down(pad, 8), 0x0002); // C-Left
+            mask = set(mask, down(pad, 9), 0x0001); // C-Right
+            mask = set(mask, down(pad, 10), 0x0800); // D-Up
+            mask = set(mask, down(pad, 11), 0x0400); // D-Down
+            mask = set(mask, down(pad, 12), 0x0200); // D-Left
+            mask = set(mask, down(pad, 13), 0x0100); // D-Right
           } else {
-            mask = set(mask, down(pad, 0), 0x8000); mask = set(mask, down(pad, 1), 0x4000);
-            mask = set(mask, down(pad, 4), 0x0020); mask = set(mask, down(pad, 5), 0x0010);
-            mask = set(mask, down(pad, 6), 0x2000); mask = set(mask, down(pad, 9), 0x1000);
-            mask = set(mask, down(pad, 12), 0x0800); mask = set(mask, down(pad, 13), 0x0400);
-            mask = set(mask, down(pad, 14), 0x0200); mask = set(mask, down(pad, 15), 0x0100);
-            const rightX = axis(pad, 2);
-            const rightY = axis(pad, 3);
-            mask = set(mask, rightY < -0.5 || down(pad, 3), 0x0008);
-            mask = set(mask, rightY > 0.5 || down(pad, 2), 0x0004);
-            mask = set(mask, rightX < -0.5, 0x0002); mask = set(mask, rightX > 0.5, 0x0001);
+            mask = set(mask, down(pad, 0), 0x8000); // A (Bottom face)
+            mask = set(mask, down(pad, 1), 0x4000); // B (Right face)
+            mask = set(mask, down(pad, 4), 0x0020); // L / L1
+            mask = set(mask, down(pad, 5), 0x0010); // R / R1
+            mask = set(mask, down(pad, 6) || down(pad, 7), 0x2000); // Z (L2 / R2 triggers)
+            mask = set(mask, down(pad, 9), 0x1000); // Start
+            mask = set(mask, down(pad, 12), 0x0800); // D-Up
+            mask = set(mask, down(pad, 13), 0x0400); // D-Down
+            mask = set(mask, down(pad, 14), 0x0200); // D-Left
+            mask = set(mask, down(pad, 15), 0x0100); // D-Right
+
+            // Right stick C-buttons (only if standard mapping with >= 4 axes)
+            if (pad.mapping === "standard" && pad.axes.length >= 4) {
+              const rightX = axis(pad, 2);
+              const rightY = axis(pad, 3);
+              if (Math.abs(rightY) > 0.55) {
+                mask = set(mask, rightY < -0.55, 0x0008); // C-Up
+                mask = set(mask, rightY > 0.55, 0x0004);  // C-Down
+              }
+              if (Math.abs(rightX) > 0.55) {
+                mask = set(mask, rightX < -0.55, 0x0002); // C-Left
+                mask = set(mask, rightX > 0.55, 0x0001);  // C-Right
+              }
+            }
           }
-          writePad(mask, stick(axis(pad, 0), raphnet ? 0.04 : 0.12),
-                   stick(-axis(pad, 1), raphnet ? 0.04 : 0.12), raphnet);
+          const deadzone = raphnet ? 0.06 : 0.18;
+          writePad(mask, stick(axis(pad, 0), deadzone),
+                   stick(-axis(pad, 1), deadzone), raphnet);
           visibleIds.push(id || "Mando");
         }
         for (const index of Array.from(activeRaphnetGamepads)) {
