@@ -1401,6 +1401,10 @@ void lbRelocInitSetup(LBRelocSetup *setup)
 	 * reset here. */
 	gmColScriptsLinkRelocTargets();
 	portResetPackedDisplayListCache();
+	for (const auto &range : sPortRelocFileRanges)
+	{
+		port_dl_range_unregister(reinterpret_cast<const void *>(range.base));
+	}
 	sPortRelocFileRanges.clear();
 
 	// Clear u16 struct fixup tracking — addresses from the old heap are stale
