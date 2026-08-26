@@ -174,29 +174,20 @@
   ]);
   document.addEventListener("keydown", (event) => {
     if (webKeyboardCodes.has(event.code)) {
-      const pending = webKeyboardReleases.get(event.code);
-      if (pending) window.clearTimeout(pending);
-      webKeyboardReleases.delete(event.code);
       webKeyboardKeys.add(event.code);
       event.preventDefault();
     }
   });
   document.addEventListener("keyup", (event) => {
     if (webKeyboardCodes.has(event.code)) {
-      // Keep very quick taps alive for several requestAnimationFrame samples.
-      // Automated tests and fast keyboards can otherwise deliver keydown and
-      // keyup between two 60 Hz input pumps, losing the button completely.
-      const pending = window.setTimeout(() => {
-        webKeyboardKeys.delete(event.code);
-        webKeyboardReleases.delete(event.code);
-      }, 400);
-      webKeyboardReleases.set(event.code, pending);
+      webKeyboardKeys.delete(event.code);
       event.preventDefault();
     }
   });
   window.addEventListener("blur", () => {
-    for (const pending of webKeyboardReleases.values()) window.clearTimeout(pending);
-    webKeyboardReleases.clear();
+    webKeyboardKeys.clear();
+  });
+  window.addEventListener("focus", () => {
     webKeyboardKeys.clear();
   });
 
@@ -205,10 +196,13 @@
     if (shared && typeof HEAPU32 !== "undefined") {
       const visibleIds = [];
       let count = 0;
+      let liveDebugText = "Sin entrada activa";
+
       const writePad = (button, stickX, stickY, isRaphnet) => {
         if (count >= shared.capacity) return;
         const base = shared.pointer + count * 6;
-        HEAPU16[base >> 1] = button & 0xffff;
+        HEAPU8[base + 0] = button & 0xff;
+        HEAPU8[base + 1] = (button >> 8) & 0xff;
         HEAP8[base + 2] = stickX;
         HEAP8[base + 3] = stickY;
         HEAPU8[base + 4] = 1;
@@ -224,6 +218,7 @@
           if (!state || !state.connected || now - state.timestamp >= 500) continue;
           writePad(state.button >>> 0, state.stickX | 0, state.stickY | 0, true);
           visibleIds.push(`Raphnet Direct ${port + 1}`);
+          liveDebugText = `Raphnet P${port+1}: Stick (${state.stickX}, ${state.stickY}) | Mask: 0x${(state.button >>> 0).toString(16)}`;
         }
       }
 
@@ -235,29 +230,18 @@
           gamepads = [];
         }
         const present = new Set();
-      const isPressed = (btn) => {
-        if (!btn) return false;
-        if (typeof btn === "object") {
-          return !!btn.pressed || (Number.isFinite(btn.value) && btn.value > 0.5);
-        }
-        return !!btn;
-      };
-      const down = (pad, index) => isPressed(pad.buttons && pad.buttons[index]);
-      const axis = (pad, index) => (pad.axes && Number.isFinite(pad.axes[index]))
-        ? Math.max(-1, Math.min(1, pad.axes[index])) : 0;
-      const stick = (value, deadzone) => Math.abs(value) < deadzone ? 0 : Math.max(-80, Math.min(80, Math.round(value * 80)));
-      const set = (mask, condition, bit) => condition ? (mask | bit) : mask;
-
-      let debugInputInfo = "";
-
-      if (count === 0) {
-        let gamepads = [];
-        try {
-          gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
-        } catch (_) {
-          gamepads = [];
-        }
-        const present = new Set();
+        const isPressed = (btn) => {
+          if (!btn) return false;
+          if (typeof btn === "object") {
+            return !!btn.pressed || (Number.isFinite(btn.value) && btn.value > 0.5);
+          }
+          return !!btn;
+        };
+        const down = (pad, index) => isPressed(pad.buttons && pad.buttons[index]);
+        const axis = (pad, index) => (pad.axes && Number.isFinite(pad.axes[index]))
+          ? Math.max(-1, Math.min(1, pad.axes[index])) : 0;
+        const stick = (value, deadzone) => Math.abs(value) < deadzone ? 0 : Math.max(-80, Math.min(80, Math.round(value * 80)));
+        const set = (mask, condition, bit) => condition ? (mask | bit) : mask;
 
         for (const pad of gamepads) {
           if (!pad || !pad.connected || count >= shared.capacity) continue;
@@ -273,7 +257,6 @@
           let mask = 0;
 
           if (isN64) {
-            // N64 native USB / Raphnet layout
             mask = set(mask, down(pad, 0), 0x8000); // A
             mask = set(mask, down(pad, 1), 0x4000); // B
             mask = set(mask, down(pad, 2), 0x2000); // Z
@@ -291,10 +274,9 @@
               mask = set(mask, down(pad, 13), 0x0100); // D-Right
             }
           } else if (isStandard) {
-            // W3C Standard Gamepad (Xbox / PlayStation / Switch Pro)
             mask = set(mask, down(pad, 0), 0x8000); // A (Bottom face)
             mask = set(mask, down(pad, 1), 0x4000); // B (Right face)
-            mask = set(mask, down(pad, 2) || down(pad, 3), 0x0008); // X/Y Jump -> C-Up
+            mask = set(mask, down(pad, 2) || down(pad, 3), 0x0008); // X/Y -> Jump
             mask = set(mask, down(pad, 4), 0x0020); // L / L1
             mask = set(mask, down(pad, 5), 0x0010); // R / R1
             mask = set(mask, down(pad, 6) || down(pad, 7), 0x2000); // Z (L2 / R2)
@@ -304,34 +286,32 @@
             mask = set(mask, down(pad, 14), 0x0200); // D-Left
             mask = set(mask, down(pad, 15), 0x0100); // D-Right
 
-            // Right stick C-buttons (only with clean deflection)
             if (pad.axes.length >= 4) {
               const rx = axis(pad, 2);
               const ry = axis(pad, 3);
               if (Math.abs(ry) > 0.6) {
-                mask = set(mask, ry < -0.6, 0x0008); // C-Up
-                mask = set(mask, ry > 0.6, 0x0004);  // C-Down
+                mask = set(mask, ry < -0.6, 0x0008);
+                mask = set(mask, ry > 0.6, 0x0004);
               }
               if (Math.abs(rx) > 0.6) {
-                mask = set(mask, rx < -0.6, 0x0002); // C-Left
-                mask = set(mask, rx > 0.6, 0x0001);  // C-Right
+                mask = set(mask, rx < -0.6, 0x0002);
+                mask = set(mask, rx > 0.6, 0x0001);
               }
             }
           } else {
-            // Generic non-standard USB gamepad
-            mask = set(mask, down(pad, 0), 0x8000); // A
-            mask = set(mask, down(pad, 1), 0x4000); // B
-            mask = set(mask, down(pad, 2), 0x2000); // Z
-            mask = set(mask, down(pad, 3), 0x0008); // Top button
-            mask = set(mask, down(pad, 4), 0x0020); // L
-            mask = set(mask, down(pad, 5), 0x0010); // R
-            mask = set(mask, down(pad, 6) || down(pad, 7), 0x2000); // Trigger
-            mask = set(mask, down(pad, 8) || down(pad, 9), 0x1000); // Start
+            mask = set(mask, down(pad, 0), 0x8000);
+            mask = set(mask, down(pad, 1), 0x4000);
+            mask = set(mask, down(pad, 2), 0x2000);
+            mask = set(mask, down(pad, 3), 0x0008);
+            mask = set(mask, down(pad, 4), 0x0020);
+            mask = set(mask, down(pad, 5), 0x0010);
+            mask = set(mask, down(pad, 6) || down(pad, 7), 0x2000);
+            mask = set(mask, down(pad, 8) || down(pad, 9), 0x1000);
             if (pad.buttons.length >= 16) {
-              mask = set(mask, down(pad, 12), 0x0800); // D-Up
-              mask = set(mask, down(pad, 13), 0x0400); // D-Down
-              mask = set(mask, down(pad, 14), 0x0200); // D-Left
-              mask = set(mask, down(pad, 15), 0x0100); // D-Right
+              mask = set(mask, down(pad, 12), 0x0800);
+              mask = set(mask, down(pad, 13), 0x0400);
+              mask = set(mask, down(pad, 14), 0x0200);
+              mask = set(mask, down(pad, 15), 0x0100);
             }
           }
 
@@ -341,44 +321,43 @@
 
           writePad(mask, sx, sy, isN64);
           visibleIds.push(id || "Mando");
-          debugInputInfo = `[${id.substring(0, 20)}] Stick: (${sx}, ${sy}) | Mask: 0x${mask.toString(16).toUpperCase()}`;
+          liveDebugText = `[${id.substring(0, 18)}] Stick: (${sx}, ${sy}) | Mask: 0x${mask.toString(16).toUpperCase()}`;
         }
         for (const index of Array.from(activeRaphnetGamepads)) {
           if (!present.has(index)) activeRaphnetGamepads.delete(index);
         }
       }
 
-      // The web port bypasses libultraship's desktop ControlDeck to avoid a
-      // synchronous SDL controller probe during startup. Preserve a small
-      // keyboard fallback when no physical pad is active so the browser build
-      // remains testable and playable without changing Raphnet priority.
       if (count === 0 && webKeyboardKeys.size > 0) {
         let mask = 0;
         const held = (code) => webKeyboardKeys.has(code);
-        if (held("KeyX")) mask |= 0x8000; // A
-        if (held("KeyC")) mask |= 0x4000; // B
-        if (held("KeyZ")) mask |= 0x2000; // Z
-        if (held("Space")) mask |= 0x1000; // Start
-        if (held("KeyE")) mask |= 0x0020; // L
-        if (held("KeyR")) mask |= 0x0010; // R
-        if (held("ArrowUp")) mask |= 0x0008;
-        if (held("ArrowDown")) mask |= 0x0004;
-        if (held("ArrowLeft")) mask |= 0x0002;
-        if (held("ArrowRight")) mask |= 0x0001;
-        if (held("KeyT")) mask |= 0x0800;
-        if (held("KeyG")) mask |= 0x0400;
-        if (held("KeyF")) mask |= 0x0200;
-        if (held("KeyH")) mask |= 0x0100;
+        if (held("KeyX")) mask |= 0x8000;
+        if (held("KeyC")) mask |= 0x4000;
+        if (held("KeyZ")) mask |= 0x2000;
+        if (held("Space")) mask |= 0x1000;
+        if (held("KeyE")) mask |= 0x0020;
+        if (held("KeyR")) mask |= 0x0010;
+        if (held("ArrowUp")) mask |= 0x0800;
+        if (held("ArrowDown")) mask |= 0x0400;
+        if (held("ArrowLeft")) mask |= 0x0200;
+        if (held("ArrowRight")) mask |= 0x0100;
         const stickX = (held("KeyD") ? 80 : 0) - (held("KeyA") ? 80 : 0);
         const stickY = (held("KeyW") ? 80 : 0) - (held("KeyS") ? 80 : 0);
         writePad(mask, stickX, stickY, false);
         visibleIds.push("Teclado");
+        liveDebugText = `Teclado: Stick (${stickX}, ${stickY}) | Teclas: ${Array.from(webKeyboardKeys).join(",")}`;
+      }
+
+      const liveDebugElem = document.getElementById("battleship-live-input-indicator");
+      if (liveDebugElem) {
+        liveDebugElem.textContent = liveDebugText;
       }
 
       HEAPU32[shared.countPointer >> 2] = count;
       globalThis.BattleShipWebInputState = {
         connected: count,
         ids: visibleIds,
+        debug: liveDebugText,
         timestamp: performance.now()
       };
     }
@@ -558,20 +537,17 @@
       saveStatus.style.color = saveState === "unavailable" ? "#ffb4ab" : "#8ff0a4";
     }, 250);
 
-    let lastConnected = -1;
     window.setInterval(() => {
       const state = globalThis.BattleShipWebInputState;
       const connected = state && Number.isFinite(state.connected) ? state.connected : 0;
-      if (connected === lastConnected) return;
-      lastConnected = connected;
       if (connected > 0) {
-        status.textContent = connected === 1 ? "Mando conectado → Jugador 1" : `${connected} mandos conectados`;
+        status.textContent = state.debug || (connected === 1 ? `Mando: ${state.ids[0] || "J1"}` : `${connected} mandos`);
         status.style.color = "#8ff0a4";
       } else {
-        status.textContent = "Mando no detectado — pulsa un botón";
+        status.textContent = "Mando no detectado — pulsa un botón (o usa teclado: WASD / X,C,Z, Espacio)";
         status.style.color = "#eee";
       }
-    }, 250);
+    }, 100);
   }
 
   if (document.readyState === "loading") {
