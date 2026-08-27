@@ -195,165 +195,10 @@
     }
   });
   window.addEventListener("blur", () => {
+    for (const pending of webKeyboardReleases.values()) window.clearTimeout(pending);
+    webKeyboardReleases.clear();
     webKeyboardKeys.clear();
   });
-
-  const RAPHNET_VENDOR_IDS = [0x289b, 0x1781, 0x1740];
-  const REPORT_SIZE_CANDIDATES = [64, 63, 32, 16, 8];
-  const REQUEST_SUSPEND_POLLING = 0x03;
-  const REQUEST_GET_CONTROLLER_TYPE = 0x06;
-  const REQUEST_RAW_SI = 0x80;
-  const N64_GET_STATUS = 0x01;
-
-  const raphnetBridge = {
-    devices: [],
-    ports: [],
-    running: false,
-    mode: "auto",
-  };
-
-  function handleRaphnetInputReport(event) {
-    const data = event.data;
-    if (!data || data.byteLength < 4) return;
-    if (!raphnetBridge.ports.length) {
-      raphnetBridge.ports = [{ channel: 0, button: 0, stickX: 0, stickY: 0, connected: true, timestamp: performance.now() }];
-    }
-    const port = raphnetBridge.ports[0];
-    port.connected = true;
-    port.timestamp = performance.now();
-    const b0 = data.getUint8(0);
-    const b1 = data.getUint8(1);
-    const sx = data.getInt8(2);
-    const sy = -data.getInt8(3);
-    port.button = ((b0 << 8) | b1) >>> 0;
-    port.stickX = sx;
-    port.stickY = sy;
-  }
-
-  async function exchangeDevice(device, reportSize, command, timeoutMs) {
-    const output = new Uint8Array(reportSize);
-    output.set(command.slice(0, reportSize));
-    await device.sendFeatureReport(0, output);
-    const deadline = performance.now() + timeoutMs;
-    do {
-      try {
-        const dataView = await device.receiveFeatureReport(0);
-        const bytes = new Uint8Array(dataView.buffer, dataView.byteOffset, dataView.byteLength);
-        const effective = (bytes.length > 1 && bytes[0] === 0 && bytes[1] === command[0]) ? bytes.slice(1) : bytes;
-        if (effective.length > 0 && effective[0] === command[0]) return effective;
-      } catch (_) {}
-      await new Promise((r) => setTimeout(r, 1));
-    } while (performance.now() < deadline);
-    throw new Error("Timeout");
-  }
-
-  async function pollRaphnetSILoop(device, reportSize) {
-    while (raphnetBridge.running && device && device.opened) {
-      for (const port of raphnetBridge.ports) {
-        try {
-          const reply = await exchangeDevice(device, reportSize, new Uint8Array([REQUEST_RAW_SI, port.channel, 1, N64_GET_STATUS]), 35);
-          if (reply.length >= 7 && reply[1] === port.channel && reply[2] === 4) {
-            port.button = ((reply[3] << 8) | reply[4]) >>> 0;
-            port.stickX = (reply[5] << 24) >> 24;
-            port.stickY = (reply[6] << 24) >> 24;
-            port.connected = true;
-            port.timestamp = performance.now();
-          } else if (reply.length >= 3 && reply[1] === port.channel && reply[2] === 0) {
-            port.connected = false;
-          }
-        } catch (_) {}
-      }
-      await new Promise((r) => requestAnimationFrame(r));
-    }
-  }
-
-  raphnetBridge.connect = async function () {
-    if (raphnetBridge.running) {
-      await raphnetBridge.disconnect();
-      return;
-    }
-    if (!("hid" in navigator)) {
-      alert("WebHID no está disponible en este navegador. Usa Google Chrome o Microsoft Edge.");
-      return;
-    }
-    try {
-      const requested = await navigator.hid.requestDevice({
-        filters: RAPHNET_VENDOR_IDS.map((vendorId) => ({ vendorId })),
-      });
-      if (!requested || !requested.length) return;
-
-      const allDevices = await navigator.hid.getDevices();
-      const candidates = allDevices.filter((d) => RAPHNET_VENDOR_IDS.includes(d.vendorId));
-      const toOpen = candidates.length ? candidates : requested;
-
-      raphnetBridge.ports = [0, 1, 2, 3].map((channel) => ({
-        channel,
-        button: 0,
-        stickX: 0,
-        stickY: 0,
-        connected: false,
-        timestamp: 0,
-      }));
-
-      let vendorSIActive = false;
-      for (const dev of toOpen) {
-        try {
-          if (!dev.opened) await dev.open();
-          dev.addEventListener("inputreport", handleRaphnetInputReport);
-          raphnetBridge.devices.push(dev);
-
-          for (const size of REPORT_SIZE_CANDIDATES) {
-            try {
-              const reply = await exchangeDevice(dev, size, new Uint8Array([REQUEST_SUSPEND_POLLING, 0]), 150);
-              if (reply[0] === REQUEST_SUSPEND_POLLING) {
-                await exchangeDevice(dev, size, new Uint8Array([REQUEST_SUSPEND_POLLING, 1]), 150);
-                raphnetBridge.running = true;
-                vendorSIActive = true;
-                void pollRaphnetSILoop(dev, size);
-                break;
-              }
-            } catch (_) {}
-          }
-        } catch (e) {
-          console.warn("Could not open HID device interface:", e);
-        }
-      }
-
-      if (!vendorSIActive) {
-        raphnetBridge.ports[0].connected = true;
-        raphnetBridge.ports[0].timestamp = performance.now();
-        raphnetBridge.running = true;
-      }
-
-      const btn = document.getElementById("battleship-raphnet-button");
-      if (btn) btn.textContent = "🔌 Desconectar Raphnet";
-      console.info("Raphnet WebHID connected successfully!", { vendorSIActive, count: raphnetBridge.devices.length });
-    } catch (err) {
-      console.error("Raphnet connection error:", err);
-      alert("Error al conectar Raphnet: " + err.message);
-    }
-  };
-
-  raphnetBridge.disconnect = async function () {
-    raphnetBridge.running = false;
-    for (const dev of raphnetBridge.devices) {
-      try {
-        dev.removeEventListener("inputreport", handleRaphnetInputReport);
-        if (dev.opened) {
-          try {
-            await exchangeDevice(dev, 64, new Uint8Array([REQUEST_SUSPEND_POLLING, 0]), 100);
-          } catch (_) {}
-          await dev.close();
-        }
-      } catch (_) {}
-    }
-    raphnetBridge.devices = [];
-    raphnetBridge.ports = [];
-    const btn = document.getElementById("battleship-raphnet-button");
-    if (btn) btn.textContent = "🔌 Conectar Mando N64 (Raphnet)";
-  };
-
-  globalThis.BattleShipRaphnet = raphnetBridge;
 
   function pumpWebInput() {
     const shared = globalThis.BattleShipWebInputShared;
@@ -363,8 +208,7 @@
       const writePad = (button, stickX, stickY, isRaphnet) => {
         if (count >= shared.capacity) return;
         const base = shared.pointer + count * 6;
-        HEAPU8[base + 0] = button & 0xff;
-        HEAPU8[base + 1] = (button >> 8) & 0xff;
+        HEAPU16[base >> 1] = button & 0xffff;
         HEAP8[base + 2] = stickX;
         HEAP8[base + 3] = stickY;
         HEAPU8[base + 4] = 1;
@@ -375,12 +219,11 @@
       const direct = globalThis.BattleShipRaphnet;
       if (direct && direct.running && Array.isArray(direct.ports)) {
         const now = performance.now();
-        for (const state of direct.ports) {
-          if (!state || count >= shared.capacity) continue;
-          if (state.connected || (now - state.timestamp < 1000 && state.timestamp > 0)) {
-            writePad(state.button >>> 0, state.stickX | 0, state.stickY | 0, true);
-            visibleIds.push(`Raphnet Puerto ${state.channel + 1} [Stick: ${state.stickX},${state.stickY} | B: 0x${(state.button || 0).toString(16)}]`);
-          }
+        for (let port = 0; port < direct.ports.length && count < shared.capacity; ++port) {
+          const state = direct.ports[port];
+          if (!state || !state.connected || now - state.timestamp >= 500) continue;
+          writePad(state.button >>> 0, state.stickX | 0, state.stickY | 0, true);
+          visibleIds.push(`Raphnet Direct ${port + 1}`);
         }
       }
 
@@ -403,97 +246,75 @@
           present.add(pad.index);
           const id = String(pad.id || "");
           const lowerId = id.toLowerCase();
-          const raphnet = lowerId.includes("raphnet") || lowerId.includes("289b") ||
-                          lowerId.includes("1781") || lowerId.includes("1740") ||
-                          lowerId.includes("n64") || lowerId.includes("retro") ||
-                          lowerId.includes("mayflash") || lowerId.includes("innext") ||
-                          (pad.mapping !== "standard" && pad.buttons.length <= 16);
+          const raphnet = lowerId.includes("raphnet") || lowerId.includes("289b");
+          const hasActivity = pad.buttons.some((button) => button && button.pressed) ||
+            pad.axes.some((value) => Number.isFinite(value) && Math.abs(value) > 0.08);
+          if (raphnet && hasActivity) activeRaphnetGamepads.add(pad.index);
+          if (raphnet && !activeRaphnetGamepads.has(pad.index)) continue;
 
           let mask = 0;
           if (raphnet) {
-            mask = set(mask, down(pad, 0), 0x8000); // A
-            mask = set(mask, down(pad, 1), 0x4000); // B
-            mask = set(mask, down(pad, 2), 0x2000); // Z
-            mask = set(mask, down(pad, 3) || down(pad, 9), 0x1000); // Start
-            mask = set(mask, down(pad, 4), 0x0020); // L
-            mask = set(mask, down(pad, 5), 0x0010); // R
-            mask = set(mask, down(pad, 6), 0x0008); // C-Up
-            mask = set(mask, down(pad, 7), 0x0004); // C-Down
-            mask = set(mask, down(pad, 8), 0x0002); // C-Left
-            mask = set(mask, down(pad, 9) && !down(pad, 3), 0x0001); // C-Right
-            if (pad.buttons.length >= 14) {
-              mask = set(mask, down(pad, 10), 0x0800); // D-Up
-              mask = set(mask, down(pad, 11), 0x0400); // D-Down
-              mask = set(mask, down(pad, 12), 0x0200); // D-Left
-              mask = set(mask, down(pad, 13), 0x0100); // D-Right
-            }
+            mask = set(mask, down(pad, 0), 0x8000); mask = set(mask, down(pad, 1), 0x4000);
+            mask = set(mask, down(pad, 2), 0x2000); mask = set(mask, down(pad, 3), 0x1000);
+            mask = set(mask, down(pad, 4), 0x0020); mask = set(mask, down(pad, 5), 0x0010);
+            mask = set(mask, down(pad, 6), 0x0008); mask = set(mask, down(pad, 7), 0x0004);
+            mask = set(mask, down(pad, 8), 0x0002); mask = set(mask, down(pad, 9), 0x0001);
+            mask = set(mask, down(pad, 10), 0x0800); mask = set(mask, down(pad, 11), 0x0400);
+            mask = set(mask, down(pad, 12), 0x0200); mask = set(mask, down(pad, 13), 0x0100);
           } else {
-            mask = set(mask, down(pad, 0), 0x8000);
-            mask = set(mask, down(pad, 1), 0x4000);
-            mask = set(mask, down(pad, 4), 0x0020);
-            mask = set(mask, down(pad, 5), 0x0010);
-            mask = set(mask, down(pad, 6) || down(pad, 7), 0x2000);
-            mask = set(mask, down(pad, 9), 0x1000);
-            if (pad.buttons.length >= 16) {
-              mask = set(mask, down(pad, 12), 0x0800);
-              mask = set(mask, down(pad, 13), 0x0400);
-              mask = set(mask, down(pad, 14), 0x0200);
-              mask = set(mask, down(pad, 15), 0x0100);
-            }
-            if (pad.axes.length >= 4) {
-              const rightX = axis(pad, 2);
-              const rightY = axis(pad, 3);
-              if (Math.abs(rightY) > 0.6) {
-                mask = set(mask, rightY < -0.6, 0x0008);
-                mask = set(mask, rightY > 0.6, 0x0004);
-              }
-              if (Math.abs(rightX) > 0.6) {
-                mask = set(mask, rightX < -0.6, 0x0002);
-                mask = set(mask, rightX > 0.6, 0x0001);
-              }
-            }
+            mask = set(mask, down(pad, 0), 0x8000); mask = set(mask, down(pad, 1), 0x4000);
+            mask = set(mask, down(pad, 4), 0x0020); mask = set(mask, down(pad, 5), 0x0010);
+            mask = set(mask, down(pad, 6), 0x2000); mask = set(mask, down(pad, 9), 0x1000);
+            mask = set(mask, down(pad, 12), 0x0800); mask = set(mask, down(pad, 13), 0x0400);
+            mask = set(mask, down(pad, 14), 0x0200); mask = set(mask, down(pad, 15), 0x0100);
+            const rightX = axis(pad, 2);
+            const rightY = axis(pad, 3);
+            mask = set(mask, rightY < -0.5 || down(pad, 3), 0x0008);
+            mask = set(mask, rightY > 0.5 || down(pad, 2), 0x0004);
+            mask = set(mask, rightX < -0.5, 0x0002); mask = set(mask, rightX > 0.5, 0x0001);
           }
-          const deadzone = raphnet ? 0.06 : 0.20;
-          const sx = stick(axis(pad, 0), deadzone);
-          const sy = stick(-axis(pad, 1), deadzone);
-          writePad(mask, sx, sy, raphnet);
-          const pressedBtns = [];
-          for (let b = 0; b < pad.buttons.length; b++) {
-            if (down(pad, b)) pressedBtns.push(`B${b}`);
-          }
-          visibleIds.push(`${id || "Mando"} [Stick: ${sx},${sy} | ${pressedBtns.join(",") || "reposo"}]`);
+          writePad(mask, stick(axis(pad, 0), raphnet ? 0.04 : 0.12),
+                   stick(-axis(pad, 1), raphnet ? 0.04 : 0.12), raphnet);
+          visibleIds.push(id || "Mando");
         }
         for (const index of Array.from(activeRaphnetGamepads)) {
           if (!present.has(index)) activeRaphnetGamepads.delete(index);
         }
-
-        if (count === 0 && webKeyboardKeys.size > 0) {
-          let mask = 0;
-          const held = (code) => webKeyboardKeys.has(code);
-          if (held("KeyX")) mask |= 0x8000; // A
-          if (held("KeyC")) mask |= 0x4000; // B
-          if (held("KeyZ")) mask |= 0x2000; // Z
-          if (held("Space")) mask |= 0x1000; // Start
-          if (held("KeyE")) mask |= 0x0020; // L
-          if (held("KeyR")) mask |= 0x0010; // R
-          if (held("ArrowUp")) mask |= 0x0800; // D-Up
-          if (held("ArrowDown")) mask |= 0x0400; // D-Down
-          if (held("ArrowLeft")) mask |= 0x0200; // D-Left
-          if (held("ArrowRight")) mask |= 0x0100; // D-Right
-          const stickX = (held("KeyD") ? 80 : 0) - (held("KeyA") ? 80 : 0);
-          const stickY = (held("KeyW") ? 80 : 0) - (held("KeyS") ? 80 : 0);
-          writePad(mask, stickX, stickY, false);
-          visibleIds.push(`Teclado [Stick: ${stickX},${stickY} | ${Array.from(webKeyboardKeys).join(",")}]`);
-        }
-
-        HEAPU32[shared.countPointer >> 2] = count;
-        globalThis.BattleShipWebInputState = {
-          connected: count,
-          ids: visibleIds,
-          rawGamepadCount: gamepads.filter(Boolean).length,
-          timestamp: performance.now()
-        };
       }
+
+      // The web port bypasses libultraship's desktop ControlDeck to avoid a
+      // synchronous SDL controller probe during startup. Preserve a small
+      // keyboard fallback when no physical pad is active so the browser build
+      // remains testable and playable without changing Raphnet priority.
+      if (count === 0 && webKeyboardKeys.size > 0) {
+        let mask = 0;
+        const held = (code) => webKeyboardKeys.has(code);
+        if (held("KeyX")) mask |= 0x8000; // A
+        if (held("KeyC")) mask |= 0x4000; // B
+        if (held("KeyZ")) mask |= 0x2000; // Z
+        if (held("Space")) mask |= 0x1000; // Start
+        if (held("KeyE")) mask |= 0x0020; // L
+        if (held("KeyR")) mask |= 0x0010; // R
+        if (held("ArrowUp")) mask |= 0x0008;
+        if (held("ArrowDown")) mask |= 0x0004;
+        if (held("ArrowLeft")) mask |= 0x0002;
+        if (held("ArrowRight")) mask |= 0x0001;
+        if (held("KeyT")) mask |= 0x0800;
+        if (held("KeyG")) mask |= 0x0400;
+        if (held("KeyF")) mask |= 0x0200;
+        if (held("KeyH")) mask |= 0x0100;
+        const stickX = (held("KeyD") ? 80 : 0) - (held("KeyA") ? 80 : 0);
+        const stickY = (held("KeyW") ? 80 : 0) - (held("KeyS") ? 80 : 0);
+        writePad(mask, stickX, stickY, false);
+        visibleIds.push("Teclado");
+      }
+
+      HEAPU32[shared.countPointer >> 2] = count;
+      globalThis.BattleShipWebInputState = {
+        connected: count,
+        ids: visibleIds,
+        timestamp: performance.now()
+      };
     }
     requestAnimationFrame(pumpWebInput);
   }
@@ -594,17 +415,7 @@
         updateAudioButton("Sonido preparado", false);
       }
     };
-    const raphnetButton = document.createElement("button");
-    raphnetButton.id = "battleship-raphnet-button";
-    raphnetButton.textContent = "🔌 Conectar Mando N64 (Raphnet)";
-    raphnetButton.style.cssText = "margin-left:8px;padding:4px 10px;cursor:pointer;font-weight:600;background:#2b5c3b;color:#fff;border:1px solid #4caf50;border-radius:4px;";
-    raphnetButton.onclick = async () => {
-      const raph = globalThis.BattleShipRaphnet;
-      if (raph && typeof raph.connect === "function") {
-        await raph.connect();
-      }
-    };
-    audioButton.insertAdjacentElement("afterend", raphnetButton);
+    button.insertAdjacentElement("afterend", audioButton);
 
     const output = document.getElementById("output");
     if (output) {
@@ -620,7 +431,7 @@
         diagnosticsButton.textContent = visible ? "Diagnóstico" : "Ocultar diagnóstico";
         fitCanvas();
       };
-      raphnetButton.insertAdjacentElement("afterend", diagnosticsButton);
+      audioButton.insertAdjacentElement("afterend", diagnosticsButton);
     }
 
     document.addEventListener("fullscreenchange", () => {
@@ -681,20 +492,20 @@
       saveStatus.style.color = saveState === "unavailable" ? "#ffb4ab" : "#8ff0a4";
     }, 250);
 
+    let lastConnected = -1;
     window.setInterval(() => {
       const state = globalThis.BattleShipWebInputState;
       const connected = state && Number.isFinite(state.connected) ? state.connected : 0;
-      if (connected > 0 && state.ids && state.ids.length) {
-        status.textContent = state.ids.join(" | ");
+      if (connected === lastConnected) return;
+      lastConnected = connected;
+      if (connected > 0) {
+        status.textContent = connected === 1 ? "Mando conectado → Jugador 1" : `${connected} mandos conectados`;
         status.style.color = "#8ff0a4";
-      } else if (state && state.rawGamepadCount > 0) {
-        status.textContent = `${state.rawGamepadCount} dispositivo(s) detectado(s) — Pulsa un botón en el mando`;
-        status.style.color = "#ffeb3b";
       } else {
-        status.textContent = "Mando no detectado — Pulsa un botón (o usa teclado: WASD / X,C,Z, Espacio)";
+        status.textContent = "Mando no detectado — pulsa un botón";
         status.style.color = "#eee";
       }
-    }, 100);
+    }, 250);
   }
 
   if (document.readyState === "loading") {

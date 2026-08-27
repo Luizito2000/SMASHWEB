@@ -15,6 +15,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1310,6 +1311,7 @@ extern "C" void port_classify_dl_ptr(uintptr_t addr, char *buf, size_t buf_size)
 		return;
 	}
 	/* No registered range. Tag by host-address heuristic. */
+#if defined(UINTPTR_MAX) && (UINTPTR_MAX > 0xFFFFFFFFull)
 	if (addr < 0x100000000ull) {
 		std::snprintf(buf, buf_size, "low_brk@0x%lx", (unsigned long)addr);
 	} else if (addr >= 0x7f0000000000ull) {
@@ -1317,6 +1319,9 @@ extern "C" void port_classify_dl_ptr(uintptr_t addr, char *buf, size_t buf_size)
 	} else {
 		std::snprintf(buf, buf_size, "other@0x%lx", (unsigned long)addr);
 	}
+#else
+	std::snprintf(buf, buf_size, "addr32@0x%lx", (unsigned long)addr);
+#endif
 }
 
 void *portRelocResolveArrayEntry(const void *array_ptr, unsigned int index)

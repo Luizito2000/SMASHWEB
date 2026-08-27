@@ -13,6 +13,7 @@
 #include "fast/interpreter.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -150,8 +151,10 @@ extern "C" int port_dl_range_classify_str(uintptr_t addr, char *buf, size_t buf_
         std::snprintf(buf, buf_size, "n64_seg[%u]+0x%x",
                       static_cast<unsigned>((addr >> 24) & 0xFF),
                       static_cast<unsigned>(addr & 0x00FFFFFFu));
+#if defined(UINTPTR_MAX) && (UINTPTR_MAX > 0xFFFFFFFFull)
     } else if (addr < 0x100000000ull) {
         std::snprintf(buf, buf_size, "low_brk@0x%lx", static_cast<unsigned long>(addr));
+#endif
     } else {
         std::snprintf(buf, buf_size, "other@0x%lx", static_cast<unsigned long>(addr));
     }
