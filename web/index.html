@@ -298,6 +298,7 @@
       .volume-icon {
         font-size: 1rem;
         cursor: pointer;
+        user-select: none;
       }
 
       .volume-slider {
@@ -454,13 +455,13 @@
       <!-- Controls & Volume Toolbar -->
       <div class="toolbar">
         <div class="toolbar-group">
-          <button id="custom-audio-btn" class="btn btn-primary">
-            🔊 Activar Sonido
+          <button id="custom-audio-btn" class="btn">
+            🔊 Sonido Activado
           </button>
           
           <!-- Volume Slider -->
           <div class="volume-box">
-            <span class="volume-icon" id="vol-icon">🔊</span>
+            <span class="volume-icon" id="vol-icon" title="Silenciar / Activar">🔊</span>
             <input type="range" id="volume-slider" class="volume-slider" min="0" max="100" value="80" title="Volumen">
             <span class="volume-label" id="vol-text">80%</span>
           </div>
@@ -531,6 +532,97 @@
     </main>
 
     <script type="text/javascript">
+      // --- UNIVERSAL MASTER AUDIO INTERCEPTOR & VOLUME MANAGER ---
+      (function() {
+        globalThis.BattleShipMasterVolume = 0.8;
+        globalThis.BattleShipAudioMuted = false;
+        globalThis.BattleShipActiveGains = [];
+        globalThis.BattleShipAllAudioContexts = new Set();
+
+        const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!OriginalAudioContext) return;
+
+        const contextMasterGainMap = new WeakMap();
+
+        // Wrapper to track and control all created AudioContexts
+        const AudioContextWrapper = function(...args) {
+          const ctx = new OriginalAudioContext(...args);
+          globalThis.BattleShipAllAudioContexts.add(ctx);
+
+          const masterGain = ctx.createGain();
+          masterGain.gain.setValueAtTime(globalThis.BattleShipMasterVolume, ctx.currentTime);
+          contextMasterGainMap.set(ctx, masterGain);
+          globalThis.BattleShipActiveGains.push(masterGain);
+
+          const origConnect = AudioNode.prototype.connect;
+          origConnect.call(masterGain, ctx.destination);
+          return ctx;
+        };
+
+        AudioContextWrapper.prototype = OriginalAudioContext.prototype;
+        window.AudioContext = AudioContextWrapper;
+        if (window.webkitAudioContext) window.webkitAudioContext = AudioContextWrapper;
+
+        // Intercept all AudioNodes connecting to destination
+        const origConnect = AudioNode.prototype.connect;
+        AudioNode.prototype.connect = function(destinationNode, outputIndex, inputIndex) {
+          if (destinationNode && this.context && destinationNode === this.context.destination) {
+            let masterGain = contextMasterGainMap.get(this.context);
+            if (!masterGain) {
+              masterGain = this.context.createGain();
+              masterGain.gain.setValueAtTime(globalThis.BattleShipAudioMuted ? 0 : globalThis.BattleShipMasterVolume, this.context.currentTime);
+              origConnect.call(masterGain, this.context.destination);
+              contextMasterGainMap.set(this.context, masterGain);
+              globalThis.BattleShipActiveGains.push(masterGain);
+            }
+            return origConnect.call(this, masterGain, outputIndex, inputIndex);
+          }
+          return origConnect.call(this, destinationNode, outputIndex, inputIndex);
+        };
+
+        // Master Volume Adjustment Function
+        globalThis.BattleShipSetVolume = function(level) {
+          const vol = Math.max(0, Math.min(1, Number(level)));
+          globalThis.BattleShipMasterVolume = vol;
+          globalThis.BattleShipAudioMuted = (vol === 0);
+
+          for (const g of globalThis.BattleShipActiveGains) {
+            try {
+              if (g && g.context && g.gain) {
+                g.gain.cancelScheduledValues(g.context.currentTime);
+                g.gain.setValueAtTime(vol, g.context.currentTime);
+              }
+            } catch (e) {}
+          }
+        };
+
+        // Master Mute / Toggle Function
+        globalThis.BattleShipToggleAudio = function() {
+          globalThis.BattleShipAudioMuted = !globalThis.BattleShipAudioMuted;
+          const targetVol = globalThis.BattleShipAudioMuted ? 0 : (globalThis.BattleShipMasterVolume || 0.8);
+
+          for (const g of globalThis.BattleShipActiveGains) {
+            try {
+              if (g && g.context && g.gain) {
+                g.gain.cancelScheduledValues(g.context.currentTime);
+                g.gain.setValueAtTime(targetVol, g.context.currentTime);
+              }
+            } catch(e) {}
+          }
+
+          // Resume any suspended AudioContext
+          for (const ctx of globalThis.BattleShipAllAudioContexts) {
+            if (ctx.state === 'suspended') ctx.resume();
+          }
+          if (globalThis.Module && globalThis.Module.SDL2 && globalThis.Module.SDL2.audioContext && globalThis.Module.SDL2.audioContext.state === 'suspended') {
+            globalThis.Module.SDL2.audioContext.resume();
+          }
+
+          return !globalThis.BattleShipAudioMuted;
+        };
+      })();
+
+      // UI Elements
       var statusElement = document.getElementById('status');
       var progressElement = document.getElementById('progress');
       var spinnerElement = document.getElementById('spinner');
@@ -587,31 +679,30 @@
         else canvasElement.requestFullscreen();
       };
 
-      customAudioBtn.onclick = () => {
-        const legacyAudioBtn = document.getElementById('battleship-audio-button');
-        if (legacyAudioBtn) legacyAudioBtn.click();
-        customAudioBtn.textContent = '🔊 Sonido Activado';
-        customAudioBtn.classList.remove('btn-primary');
-      };
-
       // Volume Slider Logic
       var applyVolume = (val) => {
         const num = parseInt(val, 10);
         volumeText.textContent = num + '%';
-        if (num === 0) volumeIcon.textContent = '🔇';
-        else if (num < 50) volumeIcon.textContent = '🔉';
-        else volumeIcon.textContent = '🔊';
-        
-        const floatVol = num / 100;
-        if (typeof globalThis.BattleShipSetVolume === 'function') {
-          globalThis.BattleShipSetVolume(floatVol);
+        if (num === 0) {
+          volumeIcon.textContent = '🔇';
+          customAudioBtn.textContent = '🔇 Sonido Silenciado';
+          customAudioBtn.classList.add('btn-primary');
+        } else if (num < 50) {
+          volumeIcon.textContent = '🔉';
+          customAudioBtn.textContent = '🔊 Sonido Activado';
+          customAudioBtn.classList.remove('btn-primary');
         } else {
-          globalThis.BattleShipVolume = floatVol;
+          volumeIcon.textContent = '🔊';
+          customAudioBtn.textContent = '🔊 Sonido Activado';
+          customAudioBtn.classList.remove('btn-primary');
         }
+        
+        globalThis.BattleShipSetVolume(num / 100);
       };
 
       volumeSlider.oninput = (e) => applyVolume(e.target.value);
-      volumeIcon.onclick = () => {
+      
+      var toggleMute = () => {
         if (volumeSlider.value > 0) {
           volumeSlider.dataset.prev = volumeSlider.value;
           volumeSlider.value = 0;
@@ -620,6 +711,9 @@
         }
         applyVolume(volumeSlider.value);
       };
+
+      volumeIcon.onclick = toggleMute;
+      customAudioBtn.onclick = toggleMute;
 
       customDiagBtn.onclick = () => {
         const visible = outputElement.style.display === 'block';
