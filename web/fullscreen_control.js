@@ -157,6 +157,7 @@
   window.setInterval(() => persistWebSave(false), 250);
   window.addEventListener("pagehide", () => persistWebSave(true));
   document.addEventListener("visibilitychange", () => {
+  
     if (document.hidden) persistWebSave(true);
   });
 
@@ -188,7 +189,7 @@
     webKeyboardKeys.clear();
   });
   const RAPHNET_VENDOR_IDS = [0x289b, 0x1781, 0x1740];
-  const REPORT_SIZE_CANDIDATES = [63, 32];
+  const REPORT_SIZE_CANDIDATES = [64, 63, 32, 16, 8];
   const REQUEST_SUSPEND_POLLING = 0x03;
   const REQUEST_GET_VERSION = 0x04;
   const REQUEST_GET_CONTROLLER_TYPE = 0x06;
@@ -201,6 +202,7 @@
     ports: [],
     running: false,
     errorCount: 0,
+    mode: "raw", // "si" or "inputreport"
   };
 
   const waitMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -214,49 +216,51 @@
     return bytes;
   }
 
-  async function exchangeRaphnet(command, timeoutMilliseconds) {
-    if (!raphnetBridge.device || !raphnetBridge.device.opened || raphnetBridge.reportSize <= 0) {
+  async function exchangeRaphnet(device, reportSize, command, timeoutMilliseconds) {
+    if (!device || !device.opened || reportSize <= 0) {
       throw new Error("Raphnet no está abierto");
     }
-    const output = new Uint8Array(raphnetBridge.reportSize);
-    output.set(command.slice(0, raphnetBridge.reportSize));
-    await raphnetBridge.device.sendFeatureReport(0, output);
+    const output = new Uint8Array(reportSize);
+    output.set(command.slice(0, reportSize));
+    await device.sendFeatureReport(0, output);
     const deadline = performance.now() + timeoutMilliseconds;
     do {
-      const dataView = await raphnetBridge.device.receiveFeatureReport(0);
-      const bytes = responseBytes(dataView, command[0]);
-      if (bytes.length > 0 && bytes[0] === command[0]) {
-        return bytes;
-      }
+      try {
+        const dataView = await device.receiveFeatureReport(0);
+        const bytes = responseBytes(dataView, command[0]);
+        if (bytes.length > 0 && bytes[0] === command[0]) {
+          return bytes;
+        }
+      } catch (_) {}
       await waitMs(1);
     } while (performance.now() < deadline);
     throw new Error(`Raphnet no respondió al comando 0x${command[0].toString(16)}`);
   }
 
-  async function chooseReportSize() {
+  async function tryProbeVendorSI(device) {
     for (const candidate of REPORT_SIZE_CANDIDATES) {
-      raphnetBridge.reportSize = candidate;
       try {
-        const reply = await exchangeRaphnet(new Uint8Array([REQUEST_SUSPEND_POLLING, 0]), 250);
-        if (reply[0] === REQUEST_SUSPEND_POLLING) return candidate;
+        const reply = await exchangeRaphnet(device, candidate, new Uint8Array([REQUEST_SUSPEND_POLLING, 0]), 200);
+        if (reply[0] === REQUEST_SUSPEND_POLLING) {
+          return candidate;
+        }
       } catch (_) {}
     }
-    raphnetBridge.reportSize = 0;
-    throw new Error("La interfaz seleccionada no acepta comandos Raphnet");
+    return 0;
   }
 
-  async function findN64Channels() {
+  async function findN64Channels(device, reportSize) {
     const channels = [];
     for (let channel = 0; channel < 4; channel++) {
       try {
-        const reply = await exchangeRaphnet(new Uint8Array([REQUEST_GET_CONTROLLER_TYPE, channel]), 150);
+        const reply = await exchangeRaphnet(device, reportSize, new Uint8Array([REQUEST_GET_CONTROLLER_TYPE, channel]), 120);
         if (reply.length >= 3 && reply[1] === channel && reply[2] === 1) channels.push(channel);
       } catch (_) {}
     }
     if (channels.length === 0) {
       for (let channel = 0; channel < 4; channel++) {
         try {
-          const reply = await exchangeRaphnet(new Uint8Array([REQUEST_RAW_SI, channel, 1, N64_GET_STATUS]), 150);
+          const reply = await exchangeRaphnet(device, reportSize, new Uint8Array([REQUEST_RAW_SI, channel, 1, N64_GET_STATUS]), 120);
           if (reply.length >= 7 && reply[1] === channel && reply[2] === 4) channels.push(channel);
         } catch (_) {}
       }
@@ -264,11 +268,33 @@
     return channels;
   }
 
-  async function pollRaphnetLoop() {
-    while (raphnetBridge.running && raphnetBridge.device && raphnetBridge.device.opened) {
+  function handleInputReport(event) {
+    const data = event.data;
+    if (!data || data.byteLength < 4) return;
+    if (!raphnetBridge.ports.length) {
+      raphnetBridge.ports = [{ channel: 0, button: 0, stickX: 0, stickY: 0, connected: true, timestamp: performance.now() }];
+    }
+    const port = raphnetBridge.ports[0];
+    port.connected = true;
+    port.timestamp = performance.now();
+
+    // Standard HID joystick report parsing
+    if (data.byteLength >= 4) {
+      const b0 = data.getUint8(0);
+      const b1 = data.getUint8(1);
+      const sx = data.getInt8(2);
+      const sy = -data.getInt8(3); // Invert Y so up is positive
+      port.button = ((b0 << 8) | b1) >>> 0;
+      port.stickX = sx;
+      port.stickY = sy;
+    }
+  }
+
+  async function pollRaphnetSILoop() {
+    while (raphnetBridge.running && raphnetBridge.device && raphnetBridge.device.opened && raphnetBridge.mode === "si") {
       for (const port of raphnetBridge.ports) {
         try {
-          const reply = await exchangeRaphnet(new Uint8Array([REQUEST_RAW_SI, port.channel, 1, N64_GET_STATUS]), 50);
+          const reply = await exchangeRaphnet(raphnetBridge.device, raphnetBridge.reportSize, new Uint8Array([REQUEST_RAW_SI, port.channel, 1, N64_GET_STATUS]), 40);
           if (reply.length >= 7 && reply[1] === port.channel && reply[2] === 4) {
             port.button = ((reply[3] << 8) | reply[4]) >>> 0;
             port.stickX = (reply[5] << 24) >> 24;
@@ -290,17 +316,23 @@
     const device = raphnetBridge.device;
     raphnetBridge.device = null;
     raphnetBridge.ports = [];
-    if (device && device.opened) {
-      try {
-        raphnetBridge.device = device;
-        await exchangeRaphnet(new Uint8Array([REQUEST_SUSPEND_POLLING, 0]), 150);
-      } catch (_) {}
-      finally {
-        raphnetBridge.device = null;
+    if (device) {
+      device.removeEventListener("inputreport", handleInputReport);
+      if (device.opened) {
+        if (raphnetBridge.mode === "si" && raphnetBridge.reportSize > 0) {
+          try {
+            await exchangeRaphnet(device, raphnetBridge.reportSize, new Uint8Array([REQUEST_SUSPEND_POLLING, 0]), 100);
+          } catch (_) {}
+        }
+        try { await device.close(); } catch (_) {}
       }
-      try { await device.close(); } catch (_) {}
     }
     raphnetBridge.reportSize = 0;
+    const statusElem = document.getElementById("battleship-gamepad-status");
+    if (statusElem) {
+      statusElem.textContent = "Raphnet desconectado.";
+      statusElem.style.color = "#eee";
+    }
   };
 
   raphnetBridge.connect = async function () {
@@ -313,25 +345,62 @@
       return;
     }
     try {
-      const devices = await navigator.hid.requestDevice({
+      const requestedDevices = await navigator.hid.requestDevice({
         filters: RAPHNET_VENDOR_IDS.map((vendorId) => ({ vendorId })),
       });
-      if (!devices.length) return;
-      const device = devices[0];
-      await device.open();
-      raphnetBridge.device = device;
-      await chooseReportSize();
-      await exchangeRaphnet(new Uint8Array([REQUEST_SUSPEND_POLLING, 1]), 250);
-      const channels = await findN64Channels();
-      if (!channels.length) throw new Error("No se encontró mando N64 conectado al adaptador");
-      raphnetBridge.ports = channels.slice(0, 4).map((channel) => ({
-        channel, button: 0, stickX: 0, stickY: 0, connected: false, timestamp: 0,
-      }));
-      raphnetBridge.running = true;
-      console.info("BattleShip Raphnet WebHID conectado", { productName: device.productName, channels });
-      void pollRaphnetLoop();
+      if (!requestedDevices.length) return;
+
+      const allDevices = await navigator.hid.getDevices();
+      const candidates = allDevices.filter((d) => RAPHNET_VENDOR_IDS.includes(d.vendorId));
+
+      let activeDevice = null;
+      let vendorReportSize = 0;
+
+      for (const dev of (candidates.length ? candidates : requestedDevices)) {
+        try {
+          if (!dev.opened) await dev.open();
+          const size = await tryProbeVendorSI(dev);
+          if (size > 0) {
+            activeDevice = dev;
+            vendorReportSize = size;
+            break;
+          }
+        } catch (_) {}
+      }
+
+      if (activeDevice && vendorReportSize > 0) {
+        // Vendor SI mode
+        raphnetBridge.device = activeDevice;
+        raphnetBridge.reportSize = vendorReportSize;
+        raphnetBridge.mode = "si";
+        await exchangeRaphnet(activeDevice, vendorReportSize, new Uint8Array([REQUEST_SUSPEND_POLLING, 1]), 200);
+        const channels = await findN64Channels(activeDevice, vendorReportSize);
+        const activeChannels = channels.length ? channels : [0];
+        raphnetBridge.ports = activeChannels.slice(0, 4).map((channel) => ({
+          channel, button: 0, stickX: 0, stickY: 0, connected: true, timestamp: performance.now(),
+        }));
+        raphnetBridge.running = true;
+        console.info("BattleShip Raphnet SI conectado", { productName: activeDevice.productName, channels: activeChannels });
+        void pollRaphnetSILoop();
+      } else {
+        // Fallback: Standard HID InputReport mode
+        const fallbackDevice = requestedDevices[0];
+        if (!fallbackDevice.opened) await fallbackDevice.open();
+        raphnetBridge.device = fallbackDevice;
+        raphnetBridge.mode = "inputreport";
+        raphnetBridge.ports = [{ channel: 0, button: 0, stickX: 0, stickY: 0, connected: true, timestamp: performance.now() }];
+        fallbackDevice.addEventListener("inputreport", handleInputReport);
+        raphnetBridge.running = true;
+        console.info("BattleShip Raphnet InputReport conectado", { productName: fallbackDevice.productName });
+      }
+
+      const statusElem = document.getElementById("battleship-gamepad-status");
+      if (statusElem) {
+        statusElem.textContent = `Raphnet conectado (${raphnetBridge.mode.toUpperCase()}) → Jugador 1`;
+        statusElem.style.color = "#8ff0a4";
+      }
     } catch (err) {
-      console.error("BattleShip Raphnet error:", err);
+      console.error("BattleShip Raphnet connection error:", err);
       alert("Error al conectar Raphnet: " + err.message);
       await raphnetBridge.disconnect();
     }
