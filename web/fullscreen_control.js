@@ -249,11 +249,8 @@
           const raphnet = lowerId.includes("raphnet") || lowerId.includes("289b") ||
                           lowerId.includes("1781") || lowerId.includes("1740") ||
                           lowerId.includes("n64") || lowerId.includes("retro") ||
-                          lowerId.includes("mayflash") || lowerId.includes("innext");
-          const hasActivity = pad.buttons.some((button) => button && button.pressed) ||
-            pad.axes.some((value) => Number.isFinite(value) && Math.abs(value) > 0.08);
-          if (raphnet && hasActivity) activeRaphnetGamepads.add(pad.index);
-          if (raphnet && !activeRaphnetGamepads.has(pad.index)) continue;
+                          lowerId.includes("mayflash") || lowerId.includes("innext") ||
+                          (pad.mapping !== "standard" && pad.buttons.length <= 16);
 
           let mask = 0;
           if (raphnet) {
@@ -267,10 +264,12 @@
             mask = set(mask, down(pad, 7), 0x0004); // C-Down
             mask = set(mask, down(pad, 8), 0x0002); // C-Left
             mask = set(mask, down(pad, 9) && !down(pad, 3), 0x0001); // C-Right
-            mask = set(mask, down(pad, 10), 0x0800); // D-Up
-            mask = set(mask, down(pad, 11), 0x0400); // D-Down
-            mask = set(mask, down(pad, 12), 0x0200); // D-Left
-            mask = set(mask, down(pad, 13), 0x0100); // D-Right
+            if (pad.buttons.length >= 14) {
+              mask = set(mask, down(pad, 10), 0x0800); // D-Up
+              mask = set(mask, down(pad, 11), 0x0400); // D-Down
+              mask = set(mask, down(pad, 12), 0x0200); // D-Left
+              mask = set(mask, down(pad, 13), 0x0100); // D-Right
+            }
           } else {
             mask = set(mask, down(pad, 0), 0x8000);
             mask = set(mask, down(pad, 1), 0x4000);
@@ -300,7 +299,7 @@
           const deadzone = raphnet ? 0.06 : 0.20;
           writePad(mask, stick(axis(pad, 0), deadzone),
                    stick(-axis(pad, 1), deadzone), raphnet);
-          visibleIds.push(id || "Mando");
+          visibleIds.push(id || "Mando N64");
         }
         for (const index of Array.from(activeRaphnetGamepads)) {
           if (!present.has(index)) activeRaphnetGamepads.delete(index);
