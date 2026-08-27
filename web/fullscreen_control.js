@@ -39,7 +39,11 @@
       // Use the browser/device sample rate for the output context.  Individual
       // N64 buffers retain their native 32 kHz rate and WebAudio resamples them.
       const context = new AudioContextClass();
-      const audio = { context, nextTime: context.currentTime, sources: new Set() };
+      const gainNode = context.createGain();
+      const initialVolume = Number.isFinite(globalThis.BattleShipVolume) ? globalThis.BattleShipVolume : 0.8;
+      gainNode.gain.value = initialVolume;
+      gainNode.connect(context.destination);
+      const audio = { context, gainNode, nextTime: context.currentTime, sources: new Set() };
       globalThis.BattleShipWebAudio = audio;
       const reflectState = () => {
         if (context.state === "running") {
@@ -83,7 +87,7 @@
       right[i] = HEAP16[input + i * 2 + 1] / 32768;
     }
     source.buffer = buffer;
-    source.connect(context.destination);
+    source.connect(audio.gainNode || context.destination);
     source.onended = () => {
       audio.sources.delete(source);
       source.disconnect();
@@ -92,6 +96,14 @@
     const startTime = Math.max(audio.nextTime, now + 0.010);
     source.start(startTime);
     audio.nextTime = startTime + frames / N64_AUDIO_SAMPLE_RATE;
+  };
+
+  globalThis.BattleShipSetVolume = function (level) {
+    const vol = Math.max(0, Math.min(1, Number(level)));
+    globalThis.BattleShipVolume = vol;
+    if (globalThis.BattleShipWebAudio && globalThis.BattleShipWebAudio.gainNode) {
+      globalThis.BattleShipWebAudio.gainNode.gain.value = vol;
+    }
   };
 
   let lastAudioSequence = 0;
