@@ -187,8 +187,163 @@
   window.addEventListener("blur", () => {
     webKeyboardKeys.clear();
   });
-  window.addEventListener("focus", () => {
-    webKeyboardKeys.clear();
+  const RAPHNET_VENDOR_IDS = [0x289b, 0x1781, 0x1740];
+  const REPORT_SIZE_CANDIDATES = [63, 32];
+  const REQUEST_SUSPEND_POLLING = 0x03;
+  const REQUEST_GET_VERSION = 0x04;
+  const REQUEST_GET_CONTROLLER_TYPE = 0x06;
+  const REQUEST_RAW_SI = 0x80;
+  const N64_GET_STATUS = 0x01;
+
+  const raphnetBridge = {
+    device: null,
+    reportSize: 0,
+    ports: [],
+    running: false,
+    errorCount: 0,
+  };
+
+  const waitMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const nextRaf = () => new Promise((resolve) => requestAnimationFrame(resolve));
+
+  function responseBytes(dataView, expectedOpcode) {
+    const bytes = new Uint8Array(dataView.buffer, dataView.byteOffset, dataView.byteLength);
+    if (bytes.length > 1 && bytes[0] === 0 && bytes[1] === expectedOpcode) {
+      return bytes.slice(1);
+    }
+    return bytes;
+  }
+
+  async function exchangeRaphnet(command, timeoutMilliseconds) {
+    if (!raphnetBridge.device || !raphnetBridge.device.opened || raphnetBridge.reportSize <= 0) {
+      throw new Error("Raphnet no está abierto");
+    }
+    const output = new Uint8Array(raphnetBridge.reportSize);
+    output.set(command.slice(0, raphnetBridge.reportSize));
+    await raphnetBridge.device.sendFeatureReport(0, output);
+    const deadline = performance.now() + timeoutMilliseconds;
+    do {
+      const dataView = await raphnetBridge.device.receiveFeatureReport(0);
+      const bytes = responseBytes(dataView, command[0]);
+      if (bytes.length > 0 && bytes[0] === command[0]) {
+        return bytes;
+      }
+      await waitMs(1);
+    } while (performance.now() < deadline);
+    throw new Error(`Raphnet no respondió al comando 0x${command[0].toString(16)}`);
+  }
+
+  async function chooseReportSize() {
+    for (const candidate of REPORT_SIZE_CANDIDATES) {
+      raphnetBridge.reportSize = candidate;
+      try {
+        const reply = await exchangeRaphnet(new Uint8Array([REQUEST_SUSPEND_POLLING, 0]), 250);
+        if (reply[0] === REQUEST_SUSPEND_POLLING) return candidate;
+      } catch (_) {}
+    }
+    raphnetBridge.reportSize = 0;
+    throw new Error("La interfaz seleccionada no acepta comandos Raphnet");
+  }
+
+  async function findN64Channels() {
+    const channels = [];
+    for (let channel = 0; channel < 4; channel++) {
+      try {
+        const reply = await exchangeRaphnet(new Uint8Array([REQUEST_GET_CONTROLLER_TYPE, channel]), 150);
+        if (reply.length >= 3 && reply[1] === channel && reply[2] === 1) channels.push(channel);
+      } catch (_) {}
+    }
+    if (channels.length === 0) {
+      for (let channel = 0; channel < 4; channel++) {
+        try {
+          const reply = await exchangeRaphnet(new Uint8Array([REQUEST_RAW_SI, channel, 1, N64_GET_STATUS]), 150);
+          if (reply.length >= 7 && reply[1] === channel && reply[2] === 4) channels.push(channel);
+        } catch (_) {}
+      }
+    }
+    return channels;
+  }
+
+  async function pollRaphnetLoop() {
+    while (raphnetBridge.running && raphnetBridge.device && raphnetBridge.device.opened) {
+      for (const port of raphnetBridge.ports) {
+        try {
+          const reply = await exchangeRaphnet(new Uint8Array([REQUEST_RAW_SI, port.channel, 1, N64_GET_STATUS]), 50);
+          if (reply.length >= 7 && reply[1] === port.channel && reply[2] === 4) {
+            port.button = ((reply[3] << 8) | reply[4]) >>> 0;
+            port.stickX = (reply[5] << 24) >> 24;
+            port.stickY = (reply[6] << 24) >> 24;
+            port.connected = true;
+            port.timestamp = performance.now();
+            raphnetBridge.errorCount = 0;
+          }
+        } catch (e) {
+          raphnetBridge.errorCount++;
+        }
+      }
+      await nextRaf();
+    }
+  }
+
+  raphnetBridge.disconnect = async function () {
+    raphnetBridge.running = false;
+    const device = raphnetBridge.device;
+    raphnetBridge.device = null;
+    raphnetBridge.ports = [];
+    if (device && device.opened) {
+      try {
+        raphnetBridge.device = device;
+        await exchangeRaphnet(new Uint8Array([REQUEST_SUSPEND_POLLING, 0]), 150);
+      } catch (_) {}
+      finally {
+        raphnetBridge.device = null;
+      }
+      try { await device.close(); } catch (_) {}
+    }
+    raphnetBridge.reportSize = 0;
+  };
+
+  raphnetBridge.connect = async function () {
+    if (raphnetBridge.running) {
+      await raphnetBridge.disconnect();
+      return;
+    }
+    if (!("hid" in navigator)) {
+      alert("WebHID no está disponible en este navegador. Usa Google Chrome o Microsoft Edge.");
+      return;
+    }
+    try {
+      const devices = await navigator.hid.requestDevice({
+        filters: RAPHNET_VENDOR_IDS.map((vendorId) => ({ vendorId })),
+      });
+      if (!devices.length) return;
+      const device = devices[0];
+      await device.open();
+      raphnetBridge.device = device;
+      await chooseReportSize();
+      await exchangeRaphnet(new Uint8Array([REQUEST_SUSPEND_POLLING, 1]), 250);
+      const channels = await findN64Channels();
+      if (!channels.length) throw new Error("No se encontró mando N64 conectado al adaptador");
+      raphnetBridge.ports = channels.slice(0, 4).map((channel) => ({
+        channel, button: 0, stickX: 0, stickY: 0, connected: false, timestamp: 0,
+      }));
+      raphnetBridge.running = true;
+      console.info("BattleShip Raphnet WebHID conectado", { productName: device.productName, channels });
+      void pollRaphnetLoop();
+    } catch (err) {
+      console.error("BattleShip Raphnet error:", err);
+      alert("Error al conectar Raphnet: " + err.message);
+      await raphnetBridge.disconnect();
+    }
+  };
+
+  globalThis.BattleShipRaphnet = raphnetBridge;
+
+  window.addEventListener("gamepadconnected", (event) => {
+    console.info("Mando Gamepad API conectado:", event.gamepad.id);
+  });
+  window.addEventListener("gamepaddisconnected", (event) => {
+    console.info("Mando Gamepad API desconectado:", event.gamepad.id);
   });
 
   function pumpWebInput() {
@@ -462,6 +617,21 @@
     };
     button.insertAdjacentElement("afterend", audioButton);
 
+    const raphnetButton = document.createElement("button");
+    raphnetButton.id = "battleship-raphnet-button";
+    raphnetButton.textContent = "🔌 Conectar Raphnet / WebHID";
+    raphnetButton.style.cssText = "margin-left:8px;padding:4px 10px;cursor:pointer;font-weight:600";
+    raphnetButton.onclick = async () => {
+      const raph = globalThis.BattleShipRaphnet;
+      if (raph && typeof raph.connect === "function") {
+        await raph.connect();
+        raphnetButton.textContent = raph.running ? "Desconectar Raphnet" : "🔌 Conectar Raphnet / WebHID";
+      } else {
+        alert("WebHID solo está disponible en navegadores basados en Chromium (Chrome, Edge, Opera, Brave).");
+      }
+    };
+    audioButton.insertAdjacentElement("afterend", raphnetButton);
+
     const output = document.getElementById("output");
     if (output) {
       const diagnosticsButton = document.createElement("button");
@@ -476,7 +646,7 @@
         diagnosticsButton.textContent = visible ? "Diagnóstico" : "Ocultar diagnóstico";
         fitCanvas();
       };
-      audioButton.insertAdjacentElement("afterend", diagnosticsButton);
+      raphnetButton.insertAdjacentElement("afterend", diagnosticsButton);
     }
 
     document.addEventListener("fullscreenchange", () => {
