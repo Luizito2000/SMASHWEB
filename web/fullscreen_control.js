@@ -258,6 +258,8 @@
             port.stickY = (reply[6] << 24) >> 24;
             port.connected = true;
             port.timestamp = performance.now();
+          } else if (reply.length >= 3 && reply[1] === port.channel && reply[2] === 0) {
+            port.connected = false;
           }
         } catch (_) {}
       }
@@ -284,6 +286,15 @@
       const candidates = allDevices.filter((d) => RAPHNET_VENDOR_IDS.includes(d.vendorId));
       const toOpen = candidates.length ? candidates : requested;
 
+      raphnetBridge.ports = [0, 1, 2, 3].map((channel) => ({
+        channel,
+        button: 0,
+        stickX: 0,
+        stickY: 0,
+        connected: false,
+        timestamp: 0,
+      }));
+
       let vendorSIActive = false;
       for (const dev of toOpen) {
         try {
@@ -296,7 +307,6 @@
               const reply = await exchangeDevice(dev, size, new Uint8Array([REQUEST_SUSPEND_POLLING, 0]), 150);
               if (reply[0] === REQUEST_SUSPEND_POLLING) {
                 await exchangeDevice(dev, size, new Uint8Array([REQUEST_SUSPEND_POLLING, 1]), 150);
-                raphnetBridge.ports = [{ channel: 0, button: 0, stickX: 0, stickY: 0, connected: true, timestamp: performance.now() }];
                 raphnetBridge.running = true;
                 vendorSIActive = true;
                 void pollRaphnetSILoop(dev, size);
@@ -310,7 +320,8 @@
       }
 
       if (!vendorSIActive) {
-        raphnetBridge.ports = [{ channel: 0, button: 0, stickX: 0, stickY: 0, connected: true, timestamp: performance.now() }];
+        raphnetBridge.ports[0].connected = true;
+        raphnetBridge.ports[0].timestamp = performance.now();
         raphnetBridge.running = true;
       }
 
@@ -364,11 +375,12 @@
       const direct = globalThis.BattleShipRaphnet;
       if (direct && direct.running && Array.isArray(direct.ports)) {
         const now = performance.now();
-        for (let port = 0; port < direct.ports.length && count < shared.capacity; ++port) {
-          const state = direct.ports[port];
-          if (!state || !state.connected || now - state.timestamp >= 500) continue;
-          writePad(state.button >>> 0, state.stickX | 0, state.stickY | 0, true);
-          visibleIds.push(`Raphnet USB ${port + 1} [Stick: ${state.stickX},${state.stickY} | B: 0x${(state.button || 0).toString(16)}]`);
+        for (const state of direct.ports) {
+          if (!state || count >= shared.capacity) continue;
+          if (state.connected || (now - state.timestamp < 1000 && state.timestamp > 0)) {
+            writePad(state.button >>> 0, state.stickX | 0, state.stickY | 0, true);
+            visibleIds.push(`Raphnet Puerto ${state.channel + 1} [Stick: ${state.stickX},${state.stickY} | B: 0x${(state.button || 0).toString(16)}]`);
+          }
         }
       }
 
